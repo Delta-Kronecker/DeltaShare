@@ -152,18 +152,20 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 
 	uptime := formatDuration(time.Since(startTime))
 
+	telegramLink := fmt.Sprintf("https://t.me/socks?server=%s&port=%s", ip, port)
+	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", ip, port)
+
 	tv.Clear()
-	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.0\n\n")
+	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.1\n\n")
 	fmt.Fprintf(tv, "[gray]Address    [white]%s:%s\n", ip, port)
 	fmt.Fprintf(tv, "[gray]Upstream   [gray]%s\n", cfg.Upstream)
 	fmt.Fprintf(tv, "[gray]Auth       %s\n", auth)
 	fmt.Fprintf(tv, "[gray]Uptime     [green]%s\n\n", uptime)
+	fmt.Fprintf(tv, "[gray]Telegram   [white]%s\n", telegramLink)
+	fmt.Fprintf(tv, "[gray]V2RayNG    [white]%s\n\n", v2rayLink)
 	fmt.Fprintf(tv, "[gray]Upload     [cyan]%s\n", humanBytes(totalUp))
 	fmt.Fprintf(tv, "[gray]Download   [cyan]%s\n", humanBytes(totalDown))
-	fmt.Fprintf(tv, "[gray]Active     [green]%d[gray]   Total [white]%d\n\n", activeCount, totalConns)
-	fmt.Fprintf(tv, "[gray]Connect via:\n")
-	fmt.Fprintf(tv, "[gray]Telegram   [white]https://t.me/socks?server=%s&port=%s\n", ip, port)
-	fmt.Fprintf(tv, "[gray]V2RayNG    [white]socks://%s:%s#DeltaShare\n", ip, port)
+	fmt.Fprintf(tv, "[gray]Active     [green]%d[gray]   Total [white]%d", activeCount, totalConns)
 }
 
 func updateTable(table *tview.Table) {
