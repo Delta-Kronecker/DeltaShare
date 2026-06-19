@@ -163,7 +163,7 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	fmt.Fprintf(tv, "[gray]Active     [green]%d[gray]   Total [white]%d\n\n", activeCount, totalConns)
 	fmt.Fprintf(tv, "[gray]Connect via:\n")
 	fmt.Fprintf(tv, "[gray]Telegram   [white]https://t.me/socks?server=%s&port=%s\n", ip, port)
-	fmt.Fprintf(tv, "[gray]V2RayNG    [white]socks://%s:%s\n", ip, port)
+	fmt.Fprintf(tv, "[gray]V2RayNG    [white]socks://%s:%s#DeltaShare\n", ip, port)
 }
 
 func updateTable(table *tview.Table) {
