@@ -43,7 +43,21 @@ type stats struct {
 
 var s = &stats{active: make(map[uint64]*connStats)}
 
-const bannerLines = 16
+const (
+	cReset  = "\033[0m"
+	cBold   = "\033[1m"
+	cDim    = "\033[2m"
+	cCyan   = "\033[36m"
+	cGreen  = "\033[32m"
+	cYellow = "\033[33m"
+	cBlue   = "\033[34m"
+	cMagenta = "\033[35m"
+	cWhite  = "\033[97m"
+	cGray   = "\033[90m"
+	cRed    = "\033[31m"
+)
+
+var startTime time.Time
 
 func main() {
 	cfg := Config{}
@@ -55,9 +69,11 @@ func main() {
 	flag.StringVar(&cfg.Password, "pass", "", "Password for client auth")
 	flag.Parse()
 
+	startTime = time.Now()
+
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%slisten failed: %v%s\n", cRed, err, cReset)
 		os.Exit(1)
 	}
 	defer ln.Close()
@@ -75,18 +91,18 @@ func main() {
 		displayIP = detectBestIP()
 	}
 
-	printBanner(displayIP, port, cfg)
+	drawDashboard(displayIP, port, cfg)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Print("\033[?25h")
-		fmt.Println("\nShutting down...")
+		fmt.Print("\033[?25h\033[0m")
+		fmt.Printf("\n  %sShutdown complete%s\n", cDim, cReset)
 		ln.Close()
 	}()
 
-	go statsRefreshLoop()
+	go refreshLoop(displayIP, port, cfg)
 
 	var wg sync.WaitGroup
 	var connID uint64
@@ -109,108 +125,150 @@ func main() {
 	}
 
 	wg.Wait()
-	printSummary()
-	fmt.Print("\033[?25h")
+	printShutdown()
+	fmt.Print("\033[?25h\033[0m")
 }
 
-func printBanner(ip, port string, cfg Config) {
-	version := "v0.3.0"
-	auth := "disabled"
+func drawDashboard(ip, port string, cfg Config) {
+	version := "v0.4.0"
+	auth := "off"
 	if cfg.Username != "" {
-		auth = "enabled"
+		auth = "on"
 	}
+	upstream := cfg.Upstream
+	uptime := formatDuration(time.Since(startTime))
 
-	fmt.Print("\033[2J\033[H")
-	fmt.Println()
-	fmt.Println("  ╔═══════════════════════════════════════════════════╗")
-	fmt.Printf("  ║             DeltaShare %-27s║\n", version)
-	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
-	fmt.Printf("  ║  Address  : %-37s║\n", ip+":"+port)
-	fmt.Printf("  ║  Auth     : %-37s║\n", auth)
-	fmt.Printf("  ║  Upstream : %-37s║\n", cfg.Upstream)
-	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
-	fmt.Println("  ║  Telegram : Settings > Proxy > SOCKS5             ║")
-	fmt.Printf("  ║             %s:%-31s║\n", ip, port)
-	fmt.Println("  ║  V2RayNG  : Type SOCKS5                          ║")
-	fmt.Printf("  ║             %s:%-31s║\n", ip, port)
-	fmt.Println("  ║  curl     : --socks5 <addr>:<port> <url>         ║")
-	fmt.Println("  ╚═══════════════════════════════════════════════════╝")
+	s.mu.RLock()
+	totalConns := s.totalConns
+	totalUp := s.totalUp
+	totalDown := s.totalDown
+	activeCount := len(s.active)
+	s.mu.RUnlock()
+
+	const W = 52
+ borderTop := cCyan + "  ╭" + strings.Repeat("─", W) + "╮" + cReset
+ borderBottom := cCyan + "  ╰" + strings.Repeat("─", W) + "╯" + cReset
+ borderMid := cCyan + "  ├" + strings.Repeat("─", W) + "┤" + cReset
+ emptyLine := cCyan + "  │" + strings.Repeat(" ", W) + "│" + cReset
+
+	fmt.Print("\033[2J\033[H\n")
+
+	fmt.Println(borderTop)
+	fmt.Println(cCyan + "  │" + cReset + "    " + cGreen + "■" + cReset + "  " + cBold + "DeltaShare" + cReset + "  " + cDim + version + cReset + strings.Repeat(" ", W-26) + cCyan + "│" + cReset)
+	fmt.Println(emptyLine)
+
+	socksLine := "  SOCKS5    " + ip + ":" + port
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "SOCKS5" + cReset + "    " + cWhite + ip+":"+port + cReset + strings.Repeat(" ", W-len(socksLine)-4) + cCyan + "│" + cReset)
+
+	upLine := "  Upstream  " + upstream
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Upstream" + cReset + "  " + cDim + upstream + cReset + strings.Repeat(" ", W-len(upLine)-4) + cCyan + "│" + cReset)
+
+	authLine := "  Auth      " + auth
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Auth" + cReset + "      " + cDim + auth + cReset + strings.Repeat(" ", W-len(authLine)-4) + cCyan + "│" + cReset)
+
+	uptimeLine := "  Uptime    " + uptime
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Uptime" + cReset + "    " + cGreen + uptime + cReset + strings.Repeat(" ", W-len(uptimeLine)-4) + cCyan + "│" + cReset)
+
+	fmt.Println(emptyLine)
+	fmt.Println(borderMid)
+	fmt.Println(emptyLine)
+
+	upBar := progressBar(totalUp, 100*1024*1024, 30)
+	downBar := progressBar(totalDown, 100*1024*1024, 30)
+
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "↑ Upload" + cReset + "   " + cYellow + upBar + cReset + " " + cCyan + "│" + cReset)
+
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "↓ Download" + cReset + " " + cYellow + downBar + cReset + " " + cCyan + "│" + cReset)
+
+	fmt.Println(emptyLine)
+	fmt.Println(borderMid)
+
+	var activeStr string
+	if activeCount > 0 {
+		activeStr = fmt.Sprintf("%s%d%s", cGreen, activeCount, cReset)
+	} else {
+		activeStr = fmt.Sprintf("%s0%s", cDim, cReset)
+	}
+	totalStr := fmt.Sprintf("%s%d%s", cWhite, totalConns, cReset)
+	upStr := humanBytes(totalUp)
+	downStr := humanBytes(totalDown)
+
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Active" + cReset + " " + activeStr + cReset + "     " + cGray + "Total" + cReset + " " + totalStr + cReset + strings.Repeat(" ", W-len("  Active   Total  ")-10) + cCyan + "│" + cReset)
+
+	fmt.Println(cCyan + "  │" + cReset + "  " + cCyan + "↑ " + upStr + cReset + "     " + cCyan + "↓ " + downStr + cReset + strings.Repeat(" ", W-len("  ↑          ↓ ")-10) + cCyan + "│" + cReset)
+
+	fmt.Println(emptyLine)
+	fmt.Println(borderBottom)
 	fmt.Println()
 	fmt.Print("\033[?25l")
 }
 
-func statsRefreshLoop() {
+func progressBar(current, max int64, width int) string {
+	if max <= 0 {
+		max = 1
+	}
+	pct := float64(current) / float64(max)
+	if pct > 1 {
+		pct = 1
+	}
+	filled := int(pct * float64(width))
+	if filled > width {
+		filled = width
+	}
+
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+	return bar
+}
+
+func refreshLoop(ip, port string, cfg Config) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		refreshTable()
+		drawDashboard(ip, port, cfg)
 	}
 }
 
-func refreshTable() {
-	s.mu.RLock()
-	active := make([]*connStats, 0, len(s.active))
-	for _, c := range s.active {
-		active = append(active, c)
-	}
-	sort.Slice(active, func(i, j int) bool {
-		return active[i].id < active[j].id
-	})
-	totalConns := s.totalConns
-	totalUp := s.totalUp
-	totalDown := s.totalDown
-	s.mu.RUnlock()
-
-	fmt.Printf("\033[%dA\033[J", bannerLines)
-
-	fmt.Println("  ┌──────┬───────────────┬────────────────────────────┬──────────┬──────────┬──────────┐")
-	fmt.Println("  │  ID  │    Client     │       Destination          │  Upload  │ Download │   Time   │")
-	fmt.Println("  ├──────┼───────────────┼────────────────────────────┼──────────┼──────────┼──────────┤")
-
-	if len(active) == 0 {
-		fmt.Println("  │                     no active connections                                         │")
-	} else {
-		for _, c := range active {
-			up := humanBytes(c.upload.Load())
-			down := humanBytes(c.download.Load())
-			dur := time.Since(c.start).Round(time.Second)
-
-			dest := c.dest
-			if len(dest) > 26 {
-				dest = dest[:23] + "..."
-			}
-			clientIP := c.clientIP
-
-			fmt.Printf("  │ #%-4d│ %-13s │ %-26s │ %8s │ %8s │ %8s │\n",
-				c.id, clientIP, dest, up, down, dur)
-		}
-	}
-
-	fmt.Println("  └──────┴───────────────┴────────────────────────────┴──────────┴──────────┴──────────┘")
-
-	if totalUp > 0 || totalDown > 0 || totalConns > 0 {
-		fmt.Printf("  Total: %d connections  |  ↑ %s  |  ↓ %s\n", totalConns, humanBytes(totalUp), humanBytes(totalDown))
-	} else {
-		fmt.Println("  Waiting for connections...")
-	}
-}
-
-func printSummary() {
+func printShutdown() {
 	s.mu.RLock()
 	totalConns := s.totalConns
 	totalUp := s.totalUp
 	totalDown := s.totalDown
 	s.mu.RUnlock()
 
-	fmt.Print("\033[?25h")
-	fmt.Println()
-	fmt.Println("  ╔═══════════════════════════════════════════════════╗")
-	fmt.Println("  ║               Session Summary                    ║")
-	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
-	fmt.Printf("  ║  Connections : %-34d║\n", totalConns)
-	fmt.Printf("  ║  Uploaded    : %-34s║\n", humanBytes(totalUp))
-	fmt.Printf("  ║  Downloaded  : %-34s║\n", humanBytes(totalDown))
-	fmt.Println("  ╚═══════════════════════════════════════════════════╝")
+	const W = 52
+	borderTop := cCyan + "  ╭" + strings.Repeat("─", W) + "╮" + cReset
+	borderBottom := cCyan + "  ╰" + strings.Repeat("─", W) + "╯" + cReset
+	borderMid := cCyan + "  ├" + strings.Repeat("─", W) + "┤" + cReset
+
+	fmt.Print("\033[?25h\n")
+	fmt.Println(borderTop)
+
+	title := "  Session Summary"
+	fmt.Println(cCyan + "  │" + cReset + "               " + cBold + "Session Summary" + cReset + strings.Repeat(" ", W-len(title)-14) + cCyan + "│" + cReset)
+
+	fmt.Println(borderMid)
+
+	line1 := fmt.Sprintf("  Connections  %d", totalConns)
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Connections" + cReset + "  " + cWhite + fmt.Sprintf("%d", totalConns) + cReset + strings.Repeat(" ", W-len(line1)-4) + cCyan + "│" + cReset)
+
+	line2 := "  Uploaded     " + humanBytes(totalUp)
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Uploaded" + cReset + "     " + cCyan + humanBytes(totalUp) + cReset + strings.Repeat(" ", W-len(line2)-4) + cCyan + "│" + cReset)
+
+	line3 := "  Downloaded   " + humanBytes(totalDown)
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Downloaded" + cReset + "   " + cCyan + humanBytes(totalDown) + cReset + strings.Repeat(" ", W-len(line3)-4) + cCyan + "│" + cReset)
+
+	dur := formatDuration(time.Since(startTime))
+	line4 := "  Duration     " + dur
+	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Duration" + cReset + "     " + cGreen + dur + cReset + strings.Repeat(" ", W-len(line4)-4) + cCyan + "│" + cReset)
+
+	fmt.Println(borderBottom)
 }
 
 func isLinkLocal(ip net.IP) bool {
@@ -229,18 +287,11 @@ func isWSL(ipStr string) bool {
 }
 
 func isUsefulIP(ip net.IP) bool {
-	ipStr := ip.String()
 	if isLinkLocal(ip) {
 		return false
 	}
-	if isWSL(ipStr) {
+	if isWSL(ip.String()) {
 		return false
-	}
-	if strings.HasPrefix(ipStr, "10.") {
-		return true
-	}
-	if strings.HasPrefix(ipStr, "192.168.") {
-		return true
 	}
 	return true
 }
@@ -569,12 +620,26 @@ func relay(a, b net.Conn, cs *connStats) (int64, int64) {
 func humanBytes(b int64) string {
 	switch {
 	case b >= 1<<30:
-		return fmt.Sprintf("%.1fGB", float64(b)/(1<<30))
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
 	case b >= 1<<20:
-		return fmt.Sprintf("%.1fMB", float64(b)/(1<<20))
+		return fmt.Sprintf("%.2f MB", float64(b)/(1<<20))
 	case b >= 1<<10:
-		return fmt.Sprintf("%.1fKB", float64(b)/(1<<10))
+		return fmt.Sprintf("%.2f KB", float64(b)/(1<<10))
 	default:
-		return fmt.Sprintf("%dB", b)
+		return fmt.Sprintf("%d B", b)
 	}
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
