@@ -73,6 +73,8 @@ func main() {
 		displayIP = detectBestIP()
 	}
 
+	currentPort := &port
+
 	app := tview.NewApplication()
 
 	infoText := tview.NewTextView().
@@ -86,12 +88,19 @@ func main() {
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(infoText, 14, 0, false).
 		AddItem(connTable, 0, 1, false)
+	flex.SetTitle(" DeltaShare ").SetBorder(true).
+		SetTitleColor(tcell.GetColor("#5DADE2")).
+		SetBorderColor(tcell.GetColor("#5DADE2"))
 
 	app.SetRoot(flex, true)
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Rune() == 's' || event.Rune() == 'S' {
-			showSettings(app, flex, infoText, connTable, &cfg, port, displayIP)
+			showSettings(app, flex, infoText, connTable, &cfg, currentPort, displayIP)
+			return nil
+		}
+		if event.Rune() == 'q' || event.Rune() == 'Q' {
+			app.Stop()
 			return nil
 		}
 		return event
@@ -102,7 +111,7 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			app.QueueUpdateDraw(func() {
-				updateInfo(infoText, displayIP, port, cfg)
+				updateInfo(infoText, displayIP, *currentPort, cfg)
 				updateTable(connTable)
 			})
 		}
@@ -145,8 +154,8 @@ func main() {
 	s.mu.RUnlock()
 }
 
-func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.TextView, connTable *tview.Table, cfg *Config, port string, displayIP string) {
-	portField := tview.NewInputField().SetLabel("Port      ").SetText(port).SetFieldWidth(5)
+func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.TextView, connTable *tview.Table, cfg *Config, currentPort *string, displayIP string) {
+	portField := tview.NewInputField().SetLabel("Port      ").SetText(*currentPort).SetFieldWidth(5)
 	userField := tview.NewInputField().SetLabel("Username  ").SetText(cfg.Username).SetFieldWidth(20)
 	passField := tview.NewInputField().SetLabel("Password  ").SetText(cfg.Password).SetFieldWidth(20).SetMaskCharacter('*')
 	upstreamField := tview.NewInputField().SetLabel("Upstream  ").SetText(cfg.Upstream).SetFieldWidth(30)
@@ -155,10 +164,17 @@ func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.Text
 		app.SetRoot(flex, true)
 		app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 			if event.Rune() == 's' || event.Rune() == 'S' {
-				showSettings(app, flex, infoText, connTable, cfg, port, displayIP)
+				showSettings(app, flex, infoText, connTable, cfg, currentPort, displayIP)
+				return nil
+			}
+			if event.Rune() == 'q' || event.Rune() == 'Q' {
+				app.Stop()
 				return nil
 			}
 			return event
+		})
+		app.QueueUpdateDraw(func() {
+			updateInfo(infoText, displayIP, *currentPort, *cfg)
 		})
 	}
 
@@ -173,11 +189,8 @@ func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.Text
 			if upstreamField.GetText() != "" {
 				cfg.Upstream = upstreamField.GetText()
 			}
-			port = portField.GetText()
+			*currentPort = portField.GetText()
 			restoreMain()
-			app.QueueUpdateDraw(func() {
-				updateInfo(infoText, displayIP, port, *cfg)
-			})
 		}).
 		AddButton("Cancel", restoreMain)
 
@@ -194,7 +207,14 @@ func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.Text
 		return event
 	})
 
-	app.SetRoot(form, true)
+	hintText := tview.NewTextView().SetDynamicColors(true).
+		SetText("[#888888][#5DADE2]Up/Down[#888888] navigate  [#5DADE2]Tab[#888888] next field  [#5DADE2]Enter[#888888] save  [#FFD93D]ESC[#888888] cancel")
+
+	layout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(form, 0, 1, true).
+		AddItem(hintText, 1, 0, false)
+
+	app.SetRoot(layout, true)
 }
 
 func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
@@ -226,7 +246,7 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	fmt.Fprintf(tv, "[#CCCCCC]Upload     [#FFD93D]%s\n", humanBytes(totalUp))
 	fmt.Fprintf(tv, "[#CCCCCC]Download   [#FFD93D]%s\n", humanBytes(totalDown))
 	fmt.Fprintf(tv, "[#CCCCCC]Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d\n\n", activeCount, totalConns)
-	fmt.Fprintf(tv, "[#888888]Press [S] Settings  [Q] Quit")
+	fmt.Fprintf(tv, "[#5DADE2][S] Settings    [#FFFFFF][Q] Quit")
 }
 
 func updateTable(table *tview.Table) {
