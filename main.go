@@ -89,6 +89,14 @@ func main() {
 
 	app.SetRoot(flex, true)
 
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == 's' || event.Rune() == 'S' {
+			showSettings(app, flex, infoText, connTable, &cfg, port, displayIP)
+			return nil
+		}
+		return event
+	})
+
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
@@ -137,6 +145,58 @@ func main() {
 	s.mu.RUnlock()
 }
 
+func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.TextView, connTable *tview.Table, cfg *Config, port string, displayIP string) {
+	portField := tview.NewInputField().SetLabel("Port      ").SetText(port).SetFieldWidth(5)
+	userField := tview.NewInputField().SetLabel("Username  ").SetText(cfg.Username).SetFieldWidth(20)
+	passField := tview.NewInputField().SetLabel("Password  ").SetText(cfg.Password).SetFieldWidth(20).SetMaskCharacter('*')
+	upstreamField := tview.NewInputField().SetLabel("Upstream  ").SetText(cfg.Upstream).SetFieldWidth(30)
+
+	restoreMain := func() {
+		app.SetRoot(flex, true)
+		app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			if event.Rune() == 's' || event.Rune() == 'S' {
+				showSettings(app, flex, infoText, connTable, cfg, port, displayIP)
+				return nil
+			}
+			return event
+		})
+	}
+
+	form := tview.NewForm().
+		AddFormItem(portField).
+		AddFormItem(userField).
+		AddFormItem(passField).
+		AddFormItem(upstreamField).
+		AddButton("Save", func() {
+			cfg.Username = userField.GetText()
+			cfg.Password = passField.GetText()
+			if upstreamField.GetText() != "" {
+				cfg.Upstream = upstreamField.GetText()
+			}
+			port = portField.GetText()
+			restoreMain()
+			app.QueueUpdateDraw(func() {
+				updateInfo(infoText, displayIP, port, *cfg)
+			})
+		}).
+		AddButton("Cancel", restoreMain)
+
+	form.SetTitle(" Settings [ESC] ").SetBorder(true)
+	form.SetTitleColor(tcell.GetColor("#FFD93D"))
+	form.SetBorderColor(tcell.GetColor("#FFD93D"))
+	form.SetBackgroundColor(tcell.NewRGBColor(15, 15, 25))
+
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			restoreMain()
+			return nil
+		}
+		return event
+	})
+
+	app.SetRoot(form, true)
+}
+
 func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	auth := "[#FF6B6B]off[#FFFFFF]"
 	if cfg.Username != "" {
@@ -156,7 +216,7 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", ip, port)
 
 	tv.Clear()
-	fmt.Fprintf(tv, "[#FFD93D]■ [#FFFFFF]DeltaShare [#888888]v0.7.0\n\n")
+	fmt.Fprintf(tv, "[#FFD93D]■ [#FFFFFF]DeltaShare [#888888]v0.8.0\n\n")
 	fmt.Fprintf(tv, "[#CCCCCC]Address    [#FFFFFF]%s:%s\n", ip, port)
 	fmt.Fprintf(tv, "[#CCCCCC]Upstream   [#AAAAAA]%s\n", cfg.Upstream)
 	fmt.Fprintf(tv, "[#CCCCCC]Auth       %s\n", auth)
@@ -165,7 +225,8 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	fmt.Fprintf(tv, "[#CCCCCC]V2RayNG    [#5DADE2]%s\n\n", v2rayLink)
 	fmt.Fprintf(tv, "[#CCCCCC]Upload     [#FFD93D]%s\n", humanBytes(totalUp))
 	fmt.Fprintf(tv, "[#CCCCCC]Download   [#FFD93D]%s\n", humanBytes(totalDown))
-	fmt.Fprintf(tv, "[#CCCCCC]Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d", activeCount, totalConns)
+	fmt.Fprintf(tv, "[#CCCCCC]Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d\n\n", activeCount, totalConns)
+	fmt.Fprintf(tv, "[#888888]Press [S] Settings  [Q] Quit")
 }
 
 func updateTable(table *tview.Table) {
