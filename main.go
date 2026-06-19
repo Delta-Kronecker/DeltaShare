@@ -7,13 +7,14 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 type Config struct {
@@ -44,18 +45,6 @@ type stats struct {
 
 var s = &stats{active: make(map[uint64]*connStats)}
 var startTime time.Time
-var lastDrawLines int
-
-const (
-	cReset = "\033[0m"
-	cBold  = "\033[1m"
-	cDim   = "\033[2m"
-	cCyan  = "\033[36m"
-	cGreen = "\033[32m"
-	cYellow = "\033[33m"
-	cWhite = "\033[97m"
-	cGray  = "\033[90m"
-)
 
 func main() {
 	cfg := Config{}
@@ -72,7 +61,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
 		os.Exit(1)
 	}
-	defer ln.Close()
 
 	actualAddr := ln.Addr().String()
 	_, port, _ := net.SplitHostPort(actualAddr)
@@ -85,54 +73,102 @@ func main() {
 		displayIP = detectBestIP()
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	app := tview.NewApplication()
+
+	infoText := tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true)
+
+	connTable := tview.NewTable().
+		SetSelectable(false, false).
+		SetFixed(1, 0)
+
+	flex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(infoText, 0, 1, false).
+		AddItem(connTable, 0, 2, false)
+
+	app.SetRoot(flex, true)
+
 	go func() {
-		<-sigCh
-		fmt.Print("\033[?25h\033[0m\n")
-		ln.Close()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			app.QueueUpdateDraw(func() {
+				updateInfo(infoText, displayIP, port, cfg)
+				updateTable(connTable)
+			})
+		}
 	}()
 
-	go refreshLoop(displayIP, port, cfg)
-
-	var wg sync.WaitGroup
-	var connID uint64
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-				break
+	go func() {
+		var wg sync.WaitGroup
+		var connID uint64
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+					break
+				}
+				continue
 			}
-			continue
+			connID++
+			id := connID
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handleConn(conn, id, cfg)
+			}()
 		}
-		connID++
-		id := connID
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			handleConn(conn, id, cfg)
-		}()
-	}
+		wg.Wait()
+		app.Stop()
+	}()
 
-	wg.Wait()
-	printFinal(displayIP, port, cfg)
-	fmt.Print("\033[?25h\033[0m")
-}
-
-func drawDashboard(ip, port string, cfg Config) {
-	version := "v0.5.0"
-	auth := "off"
-	if cfg.Username != "" {
-		auth = "on"
+	if err := app.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "UI error: %v\n", err)
+		os.Exit(1)
 	}
 
 	s.mu.RLock()
-	totalConns := s.totalConns
+	fmt.Printf("\n  Session Summary\n")
+	fmt.Printf("  Connections: %d\n", s.totalConns)
+	fmt.Printf("  Uploaded:    %s\n", humanBytes(s.totalUp))
+	fmt.Printf("  Downloaded:  %s\n", humanBytes(s.totalDown))
+	fmt.Printf("  Duration:    %s\n", formatDuration(time.Since(startTime)))
+	s.mu.RUnlock()
+}
+
+func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
+	auth := "[gray]off[white]"
+	if cfg.Username != "" {
+		auth = "[green]on[white]"
+	}
+
+	s.mu.RLock()
 	totalUp := s.totalUp
 	totalDown := s.totalDown
 	activeCount := len(s.active)
-	recent := make([]*connStats, 0, min(len(s.recent), 10))
+	totalConns := s.totalConns
+	s.mu.RUnlock()
+
+	uptime := formatDuration(time.Since(startTime))
+
+	tv.Clear()
+	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.0\n\n")
+	fmt.Fprintf(tv, "[gray]Address    [white]%s:%s\n", ip, port)
+	fmt.Fprintf(tv, "[gray]Upstream   [gray]%s\n", cfg.Upstream)
+	fmt.Fprintf(tv, "[gray]Auth       %s\n", auth)
+	fmt.Fprintf(tv, "[gray]Uptime     [green]%s\n\n", uptime)
+	fmt.Fprintf(tv, "[gray]Upload     [cyan]%s\n", humanBytes(totalUp))
+	fmt.Fprintf(tv, "[gray]Download   [cyan]%s\n", humanBytes(totalDown))
+	fmt.Fprintf(tv, "[gray]Active     [green]%d[gray]   Total [white]%d\n\n", activeCount, totalConns)
+	fmt.Fprintf(tv, "[gray]Connect via:\n")
+	fmt.Fprintf(tv, "[gray]Telegram   [white]https://t.me/socks?server=%s&port=%s\n", ip, port)
+	fmt.Fprintf(tv, "[gray]V2RayNG    [white]socks://%s:%s\n", ip, port)
+}
+
+func updateTable(table *tview.Table) {
+	s.mu.RLock()
+	recent := make([]*connStats, 0)
 	n := len(s.recent)
 	if n > 10 {
 		n = 10
@@ -142,95 +178,37 @@ func drawDashboard(ip, port string, cfg Config) {
 	}
 	s.mu.RUnlock()
 
-	uptime := formatDuration(time.Since(startTime))
+	table.Clear()
 
-	var lines []string
+	headers := []string{"ID", "Destination", "Upload", "Download", "Time"}
+	for c, h := range headers {
+		cell := tview.NewTableCell(h).
+			SetTextColor(tcellColor(tview.Styles.SecondaryTextColor)).
+			SetSelectable(false).
+			SetExpansion(1)
+		table.SetCell(0, c, cell)
+	}
 
-	lines = append(lines, "")
-	lines = append(lines, "  ╭───────────────────────────────────────────────────────────╮")
-	lines = append(lines, fmt.Sprintf("  │  %s■%s  %sDeltaShare%s  %s%s%s", cGreen, cReset, cBold, cReset, cDim, version, cReset))
-	lines = append(lines, "  │")
-	lines = append(lines, fmt.Sprintf("  │  %sAddress   %s%s:%s%s", cGray, cWhite, ip, port, cReset))
-	lines = append(lines, fmt.Sprintf("  │  %sUpstream  %s%s%s", cGray, cDim, cfg.Upstream, cReset))
-	lines = append(lines, fmt.Sprintf("  │  %sAuth      %s%s%s", cGray, cDim, auth, cReset))
-	lines = append(lines, fmt.Sprintf("  │  %sUptime    %s%s%s", cGray, cGreen, uptime, cReset))
-	lines = append(lines, "  │")
-	lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
-	lines = append(lines, "  │")
-
-	lines = append(lines, fmt.Sprintf("  │  %s↑ Upload   %s%s%s    %s↓ Download %s%s%s",
-		cGray, cCyan, humanBytes(totalUp), cReset,
-		cGray, cCyan, humanBytes(totalDown), cReset))
-
-	lines = append(lines, fmt.Sprintf("  │  %sActive    %s%d%s        %sTotal     %s%d%s",
-		cGray, cGreen, activeCount, cReset,
-		cGray, cWhite, totalConns, cReset))
-
-	lines = append(lines, "  │")
-	lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
-	lines = append(lines, "  │")
-	lines = append(lines, fmt.Sprintf("  │  %sConnect via:%s", cGray, cReset))
-	lines = append(lines, fmt.Sprintf("  │  %sTelegram:  %shttps://t.me/socks?server=%s&port=%s%s", cDim, cWhite, ip, port, cReset))
-	lines = append(lines, fmt.Sprintf("  │  %sV2RayNG:   %ssocks://%s:%s%s", cDim, cWhite, ip, port, cReset))
-	lines = append(lines, "  │")
-
-	if len(recent) > 0 {
-		lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
-		lines = append(lines, fmt.Sprintf("  │  %sRecent connections:%s", cGray, cReset))
-		lines = append(lines, "  │")
-		lines = append(lines, fmt.Sprintf("  │  %s%-6s  %-28s  %-10s  %-10s  %-8s%s", cGray, "ID", "Destination", "Upload", "Download", "Time", cReset))
-		for _, c := range recent {
-			up := humanBytes(c.upload.Load())
-			down := humanBytes(c.download.Load())
-			dur := time.Since(c.start).Round(time.Second)
-			dest := c.dest
-			if len(dest) > 28 {
-				dest = dest[:25] + "..."
-			}
-			lines = append(lines, fmt.Sprintf("  │  #%-5d %-28s  %-10s  %-10s  %-8s",
-				c.id, dest, up, down, dur))
+	for i, cs := range recent {
+		row := i + 1
+		up := humanBytes(cs.upload.Load())
+		down := humanBytes(cs.download.Load())
+		dur := formatDuration(time.Since(cs.start))
+		dest := cs.dest
+		if len(dest) > 30 {
+			dest = dest[:27] + "..."
 		}
-	}
 
-	lines = append(lines, "  │")
-	lines = append(lines, "  ╰───────────────────────────────────────────────────────────╯")
-
-	if lastDrawLines > 0 {
-		fmt.Printf("\033[%dA", lastDrawLines)
-	}
-
-	for _, l := range lines {
-		fmt.Printf("\033[2K%s\n", l)
-	}
-
-	lastDrawLines = len(lines)
-}
-
-func refreshLoop(ip, port string, cfg Config) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		drawDashboard(ip, port, cfg)
+		table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf("#%d", cs.id)).SetExpansion(1))
+		table.SetCell(row, 1, tview.NewTableCell(dest).SetExpansion(3))
+		table.SetCell(row, 2, tview.NewTableCell(up).SetExpansion(1))
+		table.SetCell(row, 3, tview.NewTableCell(down).SetExpansion(1))
+		table.SetCell(row, 4, tview.NewTableCell(dur).SetExpansion(1))
 	}
 }
 
-func printFinal(ip, port string, cfg Config) {
-	s.mu.RLock()
-	totalConns := s.totalConns
-	totalUp := s.totalUp
-	totalDown := s.totalDown
-	s.mu.RUnlock()
-
-	fmt.Print("\033[?25h")
-	fmt.Println()
-	fmt.Println("  ╭───────────────────────────────────────────────────────────╮")
-	fmt.Println("  │                  Session Summary                         │")
-	fmt.Println("  ├───────────────────────────────────────────────────────────┤")
-	fmt.Printf("  │  Connections   %d\n", totalConns)
-	fmt.Printf("  │  Uploaded      %s\n", humanBytes(totalUp))
-	fmt.Printf("  │  Downloaded    %s\n", humanBytes(totalDown))
-	fmt.Printf("  │  Duration      %s\n", formatDuration(time.Since(startTime)))
-	fmt.Println("  ╰───────────────────────────────────────────────────────────╯")
+func tcellColor(c tcell.Color) tcell.Color {
+	return c
 }
 
 func isLinkLocal(ip net.IP) bool {
@@ -329,6 +307,8 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	relay(client, upstream, cs)
 }
+
+// ─── SOCKS5 Protocol ────────────────────────────────────────────────────────
 
 func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 	buf := make([]byte, 258)
@@ -510,6 +490,8 @@ func skipAddr(atyp byte, conn net.Conn) {
 	}
 }
 
+// ─── Relay ──────────────────────────────────────────────────────────────────
+
 type countedConn struct {
 	net.Conn
 	cs   *connStats
@@ -550,6 +532,8 @@ func relay(a, b net.Conn, cs *connStats) (int64, int64) {
 	return up, down
 }
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
 func humanBytes(b int64) string {
 	switch {
 	case b >= 1<<30:
@@ -575,11 +559,4 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
