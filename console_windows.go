@@ -1,14 +1,9 @@
 package main
 
-import (
-	"syscall"
-)
-
-var (
-	kernel32         = syscall.NewLazyDLL("kernel32.dll")
-	procAllocConsole = kernel32.NewProc("AllocConsole")
-)
+import "syscall"
 
 func init() {
-	procAllocConsole.Call()
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	kernel32.NewProc("FreeConsole").Call()
+	kernel32.NewProc("AllocConsole").Call()
 }
