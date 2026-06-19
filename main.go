@@ -36,44 +36,40 @@ type connStats struct {
 type stats struct {
 	mu         sync.RWMutex
 	active     map[uint64]*connStats
+	recent     []*connStats
 	totalConns uint64
 	totalUp    int64
 	totalDown  int64
 }
 
 var s = &stats{active: make(map[uint64]*connStats)}
+var startTime time.Time
+var lastDrawLines int
 
 const (
-	cReset  = "\033[0m"
-	cBold   = "\033[1m"
-	cDim    = "\033[2m"
-	cCyan   = "\033[36m"
-	cGreen  = "\033[32m"
+	cReset = "\033[0m"
+	cBold  = "\033[1m"
+	cDim   = "\033[2m"
+	cCyan  = "\033[36m"
+	cGreen = "\033[32m"
 	cYellow = "\033[33m"
-	cBlue   = "\033[34m"
-	cMagenta = "\033[35m"
-	cWhite  = "\033[97m"
-	cGray   = "\033[90m"
-	cRed    = "\033[31m"
+	cWhite = "\033[97m"
+	cGray  = "\033[90m"
 )
-
-var startTime time.Time
 
 func main() {
 	cfg := Config{}
-
 	flag.StringVar(&cfg.ListenAddr, "listen", ":7373", "Local SOCKS5 listen address")
-	flag.StringVar(&cfg.PublicIP, "ip", "", "Public IP for display (auto-detect if empty)")
-	flag.StringVar(&cfg.Upstream, "upstream", "127.0.0.1:10808", "Upstream SOCKS5 proxy address")
-	flag.StringVar(&cfg.Username, "user", "", "Username for client auth (empty = no auth)")
-	flag.StringVar(&cfg.Password, "pass", "", "Password for client auth")
+	flag.StringVar(&cfg.PublicIP, "ip", "", "Public IP for display")
+	flag.StringVar(&cfg.Upstream, "upstream", "127.0.0.1:10808", "Upstream SOCKS5 proxy")
+	flag.StringVar(&cfg.Username, "user", "", "Username for auth")
+	flag.StringVar(&cfg.Password, "pass", "", "Password for auth")
 	flag.Parse()
-
 	startTime = time.Now()
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%slisten failed: %v%s\n", cRed, err, cReset)
+		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
@@ -84,21 +80,16 @@ func main() {
 		port = "7373"
 	}
 
-	var displayIP string
-	if cfg.PublicIP != "" {
-		displayIP = cfg.PublicIP
-	} else {
+	displayIP := cfg.PublicIP
+	if displayIP == "" {
 		displayIP = detectBestIP()
 	}
-
-	drawDashboard(displayIP, port, cfg)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Print("\033[?25h\033[0m")
-		fmt.Printf("\n  %sShutdown complete%s\n", cDim, cReset)
+		fmt.Print("\033[?25h\033[0m\n")
 		ln.Close()
 	}()
 
@@ -125,106 +116,94 @@ func main() {
 	}
 
 	wg.Wait()
-	printShutdown()
+	printFinal(displayIP, port, cfg)
 	fmt.Print("\033[?25h\033[0m")
 }
 
 func drawDashboard(ip, port string, cfg Config) {
-	version := "v0.4.0"
+	version := "v0.5.0"
 	auth := "off"
 	if cfg.Username != "" {
 		auth = "on"
 	}
-	upstream := cfg.Upstream
-	uptime := formatDuration(time.Since(startTime))
 
 	s.mu.RLock()
 	totalConns := s.totalConns
 	totalUp := s.totalUp
 	totalDown := s.totalDown
 	activeCount := len(s.active)
+	recent := make([]*connStats, 0, min(len(s.recent), 10))
+	n := len(s.recent)
+	if n > 10 {
+		n = 10
+	}
+	for i := len(s.recent) - 1; i >= len(s.recent)-n; i-- {
+		recent = append(recent, s.recent[i])
+	}
 	s.mu.RUnlock()
 
-	const W = 52
- borderTop := cCyan + "  ╭" + strings.Repeat("─", W) + "╮" + cReset
- borderBottom := cCyan + "  ╰" + strings.Repeat("─", W) + "╯" + cReset
- borderMid := cCyan + "  ├" + strings.Repeat("─", W) + "┤" + cReset
- emptyLine := cCyan + "  │" + strings.Repeat(" ", W) + "│" + cReset
+	uptime := formatDuration(time.Since(startTime))
 
-	fmt.Print("\033[2J\033[H\n")
+	var lines []string
 
-	fmt.Println(borderTop)
-	fmt.Println(cCyan + "  │" + cReset + "    " + cGreen + "■" + cReset + "  " + cBold + "DeltaShare" + cReset + "  " + cDim + version + cReset + strings.Repeat(" ", W-26) + cCyan + "│" + cReset)
-	fmt.Println(emptyLine)
+	lines = append(lines, "")
+	lines = append(lines, "  ╭───────────────────────────────────────────────────────────╮")
+	lines = append(lines, fmt.Sprintf("  │  %s■%s  %sDeltaShare%s  %s%s%s", cGreen, cReset, cBold, cReset, cDim, version, cReset))
+	lines = append(lines, "  │")
+	lines = append(lines, fmt.Sprintf("  │  %sAddress   %s%s:%s%s", cGray, cWhite, ip, port, cReset))
+	lines = append(lines, fmt.Sprintf("  │  %sUpstream  %s%s%s", cGray, cDim, cfg.Upstream, cReset))
+	lines = append(lines, fmt.Sprintf("  │  %sAuth      %s%s%s", cGray, cDim, auth, cReset))
+	lines = append(lines, fmt.Sprintf("  │  %sUptime    %s%s%s", cGray, cGreen, uptime, cReset))
+	lines = append(lines, "  │")
+	lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
+	lines = append(lines, "  │")
 
-	socksLine := "  SOCKS5    " + ip + ":" + port
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "SOCKS5" + cReset + "    " + cWhite + ip+":"+port + cReset + strings.Repeat(" ", W-len(socksLine)-4) + cCyan + "│" + cReset)
+	lines = append(lines, fmt.Sprintf("  │  %s↑ Upload   %s%s%s    %s↓ Download %s%s%s",
+		cGray, cCyan, humanBytes(totalUp), cReset,
+		cGray, cCyan, humanBytes(totalDown), cReset))
 
-	upLine := "  Upstream  " + upstream
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Upstream" + cReset + "  " + cDim + upstream + cReset + strings.Repeat(" ", W-len(upLine)-4) + cCyan + "│" + cReset)
+	lines = append(lines, fmt.Sprintf("  │  %sActive    %s%d%s        %sTotal     %s%d%s",
+		cGray, cGreen, activeCount, cReset,
+		cGray, cWhite, totalConns, cReset))
 
-	authLine := "  Auth      " + auth
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Auth" + cReset + "      " + cDim + auth + cReset + strings.Repeat(" ", W-len(authLine)-4) + cCyan + "│" + cReset)
+	lines = append(lines, "  │")
+	lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
+	lines = append(lines, "  │")
+	lines = append(lines, fmt.Sprintf("  │  %sConnect via:%s", cGray, cReset))
+	lines = append(lines, fmt.Sprintf("  │  %sTelegram:  %shttps://t.me/socks?server=%s&port=%s%s", cDim, cWhite, ip, port, cReset))
+	lines = append(lines, fmt.Sprintf("  │  %sV2RayNG:   %ssocks://%s:%s%s", cDim, cWhite, ip, port, cReset))
+	lines = append(lines, "  │")
 
-	uptimeLine := "  Uptime    " + uptime
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Uptime" + cReset + "    " + cGreen + uptime + cReset + strings.Repeat(" ", W-len(uptimeLine)-4) + cCyan + "│" + cReset)
-
-	fmt.Println(emptyLine)
-	fmt.Println(borderMid)
-	fmt.Println(emptyLine)
-
-	upBar := progressBar(totalUp, 100*1024*1024, 30)
-	downBar := progressBar(totalDown, 100*1024*1024, 30)
-
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "↑ Upload" + cReset + "   " + cYellow + upBar + cReset + " " + cCyan + "│" + cReset)
-
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "↓ Download" + cReset + " " + cYellow + downBar + cReset + " " + cCyan + "│" + cReset)
-
-	fmt.Println(emptyLine)
-	fmt.Println(borderMid)
-
-	var activeStr string
-	if activeCount > 0 {
-		activeStr = fmt.Sprintf("%s%d%s", cGreen, activeCount, cReset)
-	} else {
-		activeStr = fmt.Sprintf("%s0%s", cDim, cReset)
-	}
-	totalStr := fmt.Sprintf("%s%d%s", cWhite, totalConns, cReset)
-	upStr := humanBytes(totalUp)
-	downStr := humanBytes(totalDown)
-
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Active" + cReset + " " + activeStr + cReset + "     " + cGray + "Total" + cReset + " " + totalStr + cReset + strings.Repeat(" ", W-len("  Active   Total  ")-10) + cCyan + "│" + cReset)
-
-	fmt.Println(cCyan + "  │" + cReset + "  " + cCyan + "↑ " + upStr + cReset + "     " + cCyan + "↓ " + downStr + cReset + strings.Repeat(" ", W-len("  ↑          ↓ ")-10) + cCyan + "│" + cReset)
-
-	fmt.Println(emptyLine)
-	fmt.Println(borderBottom)
-	fmt.Println()
-	fmt.Print("\033[?25l")
-}
-
-func progressBar(current, max int64, width int) string {
-	if max <= 0 {
-		max = 1
-	}
-	pct := float64(current) / float64(max)
-	if pct > 1 {
-		pct = 1
-	}
-	filled := int(pct * float64(width))
-	if filled > width {
-		filled = width
-	}
-
-	bar := ""
-	for i := 0; i < width; i++ {
-		if i < filled {
-			bar += "█"
-		} else {
-			bar += "░"
+	if len(recent) > 0 {
+		lines = append(lines, "  ├───────────────────────────────────────────────────────────┤")
+		lines = append(lines, fmt.Sprintf("  │  %sRecent connections:%s", cGray, cReset))
+		lines = append(lines, "  │")
+		lines = append(lines, fmt.Sprintf("  │  %s%-6s  %-28s  %-10s  %-10s  %-8s%s", cGray, "ID", "Destination", "Upload", "Download", "Time", cReset))
+		for _, c := range recent {
+			up := humanBytes(c.upload.Load())
+			down := humanBytes(c.download.Load())
+			dur := time.Since(c.start).Round(time.Second)
+			dest := c.dest
+			if len(dest) > 28 {
+				dest = dest[:25] + "..."
+			}
+			lines = append(lines, fmt.Sprintf("  │  #%-5d %-28s  %-10s  %-10s  %-8s",
+				c.id, dest, up, down, dur))
 		}
 	}
-	return bar
+
+	lines = append(lines, "  │")
+	lines = append(lines, "  ╰───────────────────────────────────────────────────────────╯")
+
+	if lastDrawLines > 0 {
+		fmt.Printf("\033[%dA", lastDrawLines)
+	}
+
+	for _, l := range lines {
+		fmt.Printf("\033[2K%s\n", l)
+	}
+
+	lastDrawLines = len(lines)
 }
 
 func refreshLoop(ip, port string, cfg Config) {
@@ -235,40 +214,23 @@ func refreshLoop(ip, port string, cfg Config) {
 	}
 }
 
-func printShutdown() {
+func printFinal(ip, port string, cfg Config) {
 	s.mu.RLock()
 	totalConns := s.totalConns
 	totalUp := s.totalUp
 	totalDown := s.totalDown
 	s.mu.RUnlock()
 
-	const W = 52
-	borderTop := cCyan + "  ╭" + strings.Repeat("─", W) + "╮" + cReset
-	borderBottom := cCyan + "  ╰" + strings.Repeat("─", W) + "╯" + cReset
-	borderMid := cCyan + "  ├" + strings.Repeat("─", W) + "┤" + cReset
-
-	fmt.Print("\033[?25h\n")
-	fmt.Println(borderTop)
-
-	title := "  Session Summary"
-	fmt.Println(cCyan + "  │" + cReset + "               " + cBold + "Session Summary" + cReset + strings.Repeat(" ", W-len(title)-14) + cCyan + "│" + cReset)
-
-	fmt.Println(borderMid)
-
-	line1 := fmt.Sprintf("  Connections  %d", totalConns)
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Connections" + cReset + "  " + cWhite + fmt.Sprintf("%d", totalConns) + cReset + strings.Repeat(" ", W-len(line1)-4) + cCyan + "│" + cReset)
-
-	line2 := "  Uploaded     " + humanBytes(totalUp)
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Uploaded" + cReset + "     " + cCyan + humanBytes(totalUp) + cReset + strings.Repeat(" ", W-len(line2)-4) + cCyan + "│" + cReset)
-
-	line3 := "  Downloaded   " + humanBytes(totalDown)
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Downloaded" + cReset + "   " + cCyan + humanBytes(totalDown) + cReset + strings.Repeat(" ", W-len(line3)-4) + cCyan + "│" + cReset)
-
-	dur := formatDuration(time.Since(startTime))
-	line4 := "  Duration     " + dur
-	fmt.Println(cCyan + "  │" + cReset + "  " + cGray + "Duration" + cReset + "     " + cGreen + dur + cReset + strings.Repeat(" ", W-len(line4)-4) + cCyan + "│" + cReset)
-
-	fmt.Println(borderBottom)
+	fmt.Print("\033[?25h")
+	fmt.Println()
+	fmt.Println("  ╭───────────────────────────────────────────────────────────╮")
+	fmt.Println("  │                  Session Summary                         │")
+	fmt.Println("  ├───────────────────────────────────────────────────────────┤")
+	fmt.Printf("  │  Connections   %d\n", totalConns)
+	fmt.Printf("  │  Uploaded      %s\n", humanBytes(totalUp))
+	fmt.Printf("  │  Downloaded    %s\n", humanBytes(totalDown))
+	fmt.Printf("  │  Duration      %s\n", formatDuration(time.Since(startTime)))
+	fmt.Println("  ╰───────────────────────────────────────────────────────────╯")
 }
 
 func isLinkLocal(ip net.IP) bool {
@@ -276,24 +238,15 @@ func isLinkLocal(ip net.IP) bool {
 }
 
 func isWSL(ipStr string) bool {
-	return strings.HasPrefix(ipStr, "172.16.") || strings.HasPrefix(ipStr, "172.17.") ||
-		strings.HasPrefix(ipStr, "172.18.") || strings.HasPrefix(ipStr, "172.19.") ||
-		strings.HasPrefix(ipStr, "172.20.") || strings.HasPrefix(ipStr, "172.21.") ||
-		strings.HasPrefix(ipStr, "172.22.") || strings.HasPrefix(ipStr, "172.23.") ||
-		strings.HasPrefix(ipStr, "172.24.") || strings.HasPrefix(ipStr, "172.25.") ||
-		strings.HasPrefix(ipStr, "172.26.") || strings.HasPrefix(ipStr, "172.27.") ||
-		strings.HasPrefix(ipStr, "172.28.") || strings.HasPrefix(ipStr, "172.29.") ||
-		strings.HasPrefix(ipStr, "172.30.") || strings.HasPrefix(ipStr, "172.31.")
-}
-
-func isUsefulIP(ip net.IP) bool {
-	if isLinkLocal(ip) {
-		return false
-	}
-	if isWSL(ip.String()) {
-		return false
-	}
-	return true
+	return strings.HasPrefix(ipStr, "172.") && (strings.HasPrefix(ipStr, "172.16.") ||
+		strings.HasPrefix(ipStr, "172.17.") || strings.HasPrefix(ipStr, "172.18.") ||
+		strings.HasPrefix(ipStr, "172.19.") || strings.HasPrefix(ipStr, "172.20.") ||
+		strings.HasPrefix(ipStr, "172.21.") || strings.HasPrefix(ipStr, "172.22.") ||
+		strings.HasPrefix(ipStr, "172.23.") || strings.HasPrefix(ipStr, "172.24.") ||
+		strings.HasPrefix(ipStr, "172.25.") || strings.HasPrefix(ipStr, "172.26.") ||
+		strings.HasPrefix(ipStr, "172.27.") || strings.HasPrefix(ipStr, "172.28.") ||
+		strings.HasPrefix(ipStr, "172.29.") || strings.HasPrefix(ipStr, "172.30.") ||
+		strings.HasPrefix(ipStr, "172.31."))
 }
 
 func detectBestIP() string {
@@ -313,17 +266,15 @@ func detectBestIP() string {
 		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
 			continue
 		}
-		if !isUsefulIP(ipNet.IP) {
+		if isLinkLocal(ipNet.IP) || isWSL(ipNet.IP.String()) {
 			continue
 		}
 		ipStr := ipNet.IP.String()
-		prefs := 0
+		prefs := 1
 		if strings.HasPrefix(ipStr, "10.") {
 			prefs = 3
 		} else if strings.HasPrefix(ipStr, "192.168.") {
 			prefs = 2
-		} else {
-			prefs = 1
 		}
 		candidates = append(candidates, candidate{ip: ipStr, prefs: prefs})
 	}
@@ -331,11 +282,9 @@ func detectBestIP() string {
 	if len(candidates) == 0 {
 		return "127.0.0.1"
 	}
-
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].prefs > candidates[j].prefs
 	})
-
 	return candidates[0].ip
 }
 
@@ -354,6 +303,10 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 	s.mu.Lock()
 	s.active[id] = cs
 	s.totalConns++
+	s.recent = append(s.recent, cs)
+	if len(s.recent) > 20 {
+		s.recent = s.recent[len(s.recent)-20:]
+	}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -374,13 +327,11 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 	}
 
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-
 	relay(client, upstream, cs)
 }
 
 func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 	buf := make([]byte, 258)
-
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return "", err
 	}
@@ -394,11 +345,9 @@ func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 
 	needAuth := cfg.Username != ""
 	method := selectMethod(buf[:nMethods], needAuth)
-
 	if _, err := conn.Write([]byte{0x05, method}); err != nil {
 		return "", err
 	}
-
 	if method == 0x02 {
 		if err := authServer(conn, cfg); err != nil {
 			return "", err
@@ -412,11 +361,7 @@ func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return "", fmt.Errorf("cmd %d not supported", buf[1])
 	}
-	addr, err := readAddr(buf[3], conn)
-	if err != nil {
-		return "", err
-	}
-	return addr, nil
+	return readAddr(buf[3], conn)
 }
 
 func selectMethod(methods []byte, needAuth bool) byte {
@@ -496,7 +441,6 @@ func readAddr(atyp byte, conn net.Conn) (string, error) {
 	if err := binary.Read(conn, binary.BigEndian, &port); err != nil {
 		return "", err
 	}
-
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
@@ -504,7 +448,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return err
 	}
-
 	var resp [2]byte
 	if _, err := io.ReadFull(conn, resp[:]); err != nil {
 		return err
@@ -513,7 +456,7 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 		return fmt.Errorf("upstream version %d", resp[1])
 	}
 	if resp[1] != 0x00 {
-		return fmt.Errorf("upstream requested unsupported method: %d", resp[1])
+		return fmt.Errorf("upstream unsupported method: %d", resp[1])
 	}
 
 	host, portStr, err := net.SplitHostPort(dest)
@@ -524,7 +467,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	fmt.Sscanf(portStr, "%d", &port)
 
 	req := []byte{0x05, 0x01, 0x00}
-
 	ip := net.ParseIP(host)
 	if ip4 := ip.To4(); ip4 != nil {
 		req = append(req, 0x01)
@@ -537,7 +479,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 		req = append(req, byte(len(host)))
 		req = append(req, host...)
 	}
-
 	portBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBuf, port)
 	req = append(req, portBuf...)
@@ -545,7 +486,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	if _, err := conn.Write(req); err != nil {
 		return err
 	}
-
 	var reply [10]byte
 	if _, err := io.ReadFull(conn, reply[:4]); err != nil {
 		return err
@@ -554,7 +494,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 		return fmt.Errorf("upstream CONNECT failed: %d", reply[1])
 	}
 	skipAddr(reply[3], conn)
-
 	return nil
 }
 
@@ -590,29 +529,23 @@ func (c *countedConn) Read(p []byte) (int, error) {
 func relay(a, b net.Conn, cs *connStats) (int64, int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	var up, down int64
-
 	go func() {
 		defer wg.Done()
-		cc := &countedConn{Conn: a, cs: cs, isUp: true}
-		n, _ := io.Copy(b, cc)
+		n, _ := io.Copy(b, &countedConn{Conn: a, cs: cs, isUp: true})
 		up = n
 		if tc, ok := b.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
-
 	go func() {
 		defer wg.Done()
-		cc := &countedConn{Conn: b, cs: cs, isUp: false}
-		n, _ := io.Copy(a, cc)
+		n, _ := io.Copy(a, &countedConn{Conn: b, cs: cs, isUp: false})
 		down = n
 		if tc, ok := a.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
-
 	wg.Wait()
 	return up, down
 }
@@ -642,4 +575,11 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
