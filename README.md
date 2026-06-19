@@ -15,9 +15,8 @@ DeltaShare listens on all network interfaces and forwards SOCKS5 traffic to a lo
 - SOCKS5 proxy chaining (client -> DeltaShare -> upstream proxy -> internet)
 - Optional username/password authentication
 - IPv4, IPv6, and domain name support
-- Startup banner with all available network addresses
-- Live connection monitoring with real-time bandwidth tracking
-- Session summary on shutdown
+- Clean terminal UI with real-time connection monitoring
+- Only shows usable LAN IPs (hides link-local and WSL addresses)
 - Works with Telegram, V2RayNG, browsers, curl, and any SOCKS5 client
 
 ## Build
@@ -43,50 +42,41 @@ deltashare -listen 0.0.0.0:7373 -upstream 127.0.0.1:10808 -user myuser -pass myp
 deltashare -listen 0.0.0.0:7373 -upstream 127.0.0.1:10808 -ip 203.0.113.1
 ```
 
-## Startup Output
+## Interface
 
 ```
-╔════════════════════════════════════════════════════╗
-║              DeltaShare v0.2.0                     ║
-╠════════════════════════════════════════════════════╣
-║  Listening on  : 0.0.0.0:7373                     ║
-║  SOCKS5 Proxy  : 192.168.1.100:7373               ║
-║  Auth          : disabled                          ║
-║  Upstream      : 127.0.0.1:10808                  ║
-╠════════════════════════════════════════════════════╣
-║  Available addresses:                              ║
-║    * 192.168.1.100:7373 (recommended)             ║
-║      169.254.58.54:7373                           ║
-╠════════════════════════════════════════════════════╣
-║  Example (Telegram):                               ║
-║    SOCKS5: 192.168.1.100:7373                     ║
-║  Example (V2RayNG):                                ║
-║    Address: 192.168.1.100                          ║
-║    Port   : 7373                                   ║
-║  Example (curl):                                   ║
-║    curl --socks5 192.168.1.100:7373 https://...   ║
-╚════════════════════════════════════════════════════╝
-```
+  ╔═══════════════════════════════════════════════════╗
+  ║             DeltaShare v0.3.0                    ║
+  ╠═══════════════════════════════════════════════════╣
+  ║  Address  : 10.14.2.15:7373                      ║
+  ║  Auth     : disabled                             ║
+  ║  Upstream : 127.0.0.1:10808                      ║
+  ╠═══════════════════════════════════════════════════╣
+  ║  Telegram : Settings > Proxy > SOCKS5             ║
+  ║             10.14.2.15:7373                      ║
+  ║  V2RayNG  : Type SOCKS5                          ║
+  ║             10.14.2.15:7373                      ║
+  ║  curl     : --socks5 <addr>:<port> <url>         ║
+  ╚═══════════════════════════════════════════════════╝
 
-## Live Monitoring
-
-Every 15 seconds, active connections are displayed:
-
-```
-── Connections: 2 active / 5 total ──
-   ID     Client   Destination              Upload     Download   Time
-   #1     10.0.0.  google.com:443           12.3KB     45.6KB     2m30s
-   #3     10.0.0.  github.com:443           1.2KB      89.1KB     45s
-── Total: ↑234.5KB  ↓1.2MB ──
+  ┌──────┬───────────────┬────────────────────────────┬──────────┬──────────┬──────────┐
+  │  ID  │    Client     │       Destination          │  Upload  │ Download │   Time   │
+  ├──────┼───────────────┼────────────────────────────┼──────────┼──────────┼──────────┤
+  │ #1   │ 192.168.1.5   │ google.com:443             │   12.3KB │   45.6KB │   2m30s  │
+  │ #2   │ 192.168.1.8   │ github.com:443             │    1.2KB │   89.1KB │     45s  │
+  └──────┴───────────────┴────────────────────────────┴──────────┴──────────┴──────────┘
+  Total: 5 connections  |  ↑ 234.5KB  |  ↓ 1.2MB
 ```
 
 ## Client Setup
 
-Connect any SOCKS5-capable app to your machine's IP on port 7373.
-
 **Telegram:** Settings -> Data and Storage -> Proxy Settings -> Add SOCKS5 Proxy
+
 **V2RayNG:** Add Server -> Type: SOCKS -> Address: your-ip, Port: 7373
+
 **Browser:** Set SOCKS5 proxy to your IP, port 7373
+
+**curl:** `curl --socks5 10.14.2.15:7373 https://example.com`
 
 ## Flags
 

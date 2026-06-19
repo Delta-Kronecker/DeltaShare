@@ -5,10 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,15 +34,16 @@ type connStats struct {
 }
 
 type stats struct {
-	mu          sync.RWMutex
-	active      map[uint64]*connStats
-	totalConns  uint64
-	totalUp     int64
-	totalDown   int64
-	activeCount int64
+	mu         sync.RWMutex
+	active     map[uint64]*connStats
+	totalConns uint64
+	totalUp    int64
+	totalDown  int64
 }
 
 var s = &stats{active: make(map[uint64]*connStats)}
+
+const bannerLines = 16
 
 func main() {
 	cfg := Config{}
@@ -54,11 +55,10 @@ func main() {
 	flag.StringVar(&cfg.Password, "pass", "", "Password for client auth")
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
-		log.Fatalf("listen failed: %v", err)
+		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
+		os.Exit(1)
 	}
 	defer ln.Close()
 
@@ -75,20 +75,18 @@ func main() {
 		displayIP = detectBestIP()
 	}
 
-	printBanner(displayIP, port, cfg, actualAddr)
-
-	log.Printf("Listening on %s", actualAddr)
+	printBanner(displayIP, port, cfg)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println()
-		log.Println("Shutting down...")
+		fmt.Print("\033[?25h")
+		fmt.Println("\nShutting down...")
 		ln.Close()
 	}()
 
-	go printStatsLoop()
+	go statsRefreshLoop()
 
 	var wg sync.WaitGroup
 	var connID uint64
@@ -99,13 +97,10 @@ func main() {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
 				break
 			}
-			log.Printf("accept error: %v", err)
 			continue
 		}
 		connID++
 		id := connID
-		clientAddr := conn.RemoteAddr().String()
-		log.Printf("[#%d] accepted from %s", id, clientAddr)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -114,52 +109,140 @@ func main() {
 	}
 
 	wg.Wait()
-	printStatsFinal()
-	log.Println("DeltaShare stopped")
+	printSummary()
+	fmt.Print("\033[?25h")
 }
 
-func printBanner(ip, port string, cfg Config, listenAddr string) {
-	version := "v0.2.0"
-	fmt.Println()
-	fmt.Println("╔════════════════════════════════════════════════════╗")
-	fmt.Printf("║              DeltaShare %-24s║\n", version)
-	fmt.Println("╠════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Listening on  : %-32s║\n", listenAddr)
-	fmt.Printf("║  SOCKS5 Proxy  : %-32s║\n", ip+":"+port)
+func printBanner(ip, port string, cfg Config) {
+	version := "v0.3.0"
+	auth := "disabled"
 	if cfg.Username != "" {
-		fmt.Printf("║  Auth          : %-32s║\n", "enabled (username/password)")
-	} else {
-		fmt.Printf("║  Auth          : %-32s║\n", "disabled")
+		auth = "enabled"
 	}
-	fmt.Printf("║  Upstream      : %-32s║\n", cfg.Upstream)
 
-	allIPs := listAllIPs()
-	if len(allIPs) > 0 {
-		fmt.Println("╠════════════════════════════════════════════════════╣")
-		fmt.Println("║  Available addresses:                              ║")
-		for _, a := range allIPs {
-			if a == ip {
-				fmt.Printf("║    * %s:%s (recommended)\n", a, port)
-			} else {
-				fmt.Printf("║      %s:%s\n", a, port)
+	fmt.Print("\033[2J\033[H")
+	fmt.Println()
+	fmt.Println("  ╔═══════════════════════════════════════════════════╗")
+	fmt.Printf("  ║             DeltaShare %-27s║\n", version)
+	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
+	fmt.Printf("  ║  Address  : %-37s║\n", ip+":"+port)
+	fmt.Printf("  ║  Auth     : %-37s║\n", auth)
+	fmt.Printf("  ║  Upstream : %-37s║\n", cfg.Upstream)
+	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
+	fmt.Println("  ║  Telegram : Settings > Proxy > SOCKS5             ║")
+	fmt.Printf("  ║             %s:%-31s║\n", ip, port)
+	fmt.Println("  ║  V2RayNG  : Type SOCKS5                          ║")
+	fmt.Printf("  ║             %s:%-31s║\n", ip, port)
+	fmt.Println("  ║  curl     : --socks5 <addr>:<port> <url>         ║")
+	fmt.Println("  ╚═══════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Print("\033[?25l")
+}
+
+func statsRefreshLoop() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		refreshTable()
+	}
+}
+
+func refreshTable() {
+	s.mu.RLock()
+	active := make([]*connStats, 0, len(s.active))
+	for _, c := range s.active {
+		active = append(active, c)
+	}
+	sort.Slice(active, func(i, j int) bool {
+		return active[i].id < active[j].id
+	})
+	totalConns := s.totalConns
+	totalUp := s.totalUp
+	totalDown := s.totalDown
+	s.mu.RUnlock()
+
+	fmt.Printf("\033[%dA\033[J", bannerLines)
+
+	fmt.Println("  ┌──────┬───────────────┬────────────────────────────┬──────────┬──────────┬──────────┐")
+	fmt.Println("  │  ID  │    Client     │       Destination          │  Upload  │ Download │   Time   │")
+	fmt.Println("  ├──────┼───────────────┼────────────────────────────┼──────────┼──────────┼──────────┤")
+
+	if len(active) == 0 {
+		fmt.Println("  │                     no active connections                                         │")
+	} else {
+		for _, c := range active {
+			up := humanBytes(c.upload.Load())
+			down := humanBytes(c.download.Load())
+			dur := time.Since(c.start).Round(time.Second)
+
+			dest := c.dest
+			if len(dest) > 26 {
+				dest = dest[:23] + "..."
 			}
+			clientIP := c.clientIP
+
+			fmt.Printf("  │ #%-4d│ %-13s │ %-26s │ %8s │ %8s │ %8s │\n",
+				c.id, clientIP, dest, up, down, dur)
 		}
 	}
 
-	fmt.Println("╠════════════════════════════════════════════════════╣")
-	fmt.Println("║  Example (Telegram):                               ║")
-	fmt.Printf("║    SOCKS5: %s:%-21s║\n", ip, port)
-	fmt.Println("║  Example (V2RayNG):                                ║")
-	fmt.Printf("║    Address: %-36s║\n", ip)
-	fmt.Printf("║    Port   : %-36s║\n", port)
-	fmt.Println("║  Example (curl):                                   ║")
-	fmt.Printf("║    curl --socks5 %s:%s https://example.com   ║\n", ip, port)
-	fmt.Println("╚════════════════════════════════════════════════════╝")
+	fmt.Println("  └──────┴───────────────┴────────────────────────────┴──────────┴──────────┴──────────┘")
+
+	if totalUp > 0 || totalDown > 0 || totalConns > 0 {
+		fmt.Printf("  Total: %d connections  |  ↑ %s  |  ↓ %s\n", totalConns, humanBytes(totalUp), humanBytes(totalDown))
+	} else {
+		fmt.Println("  Waiting for connections...")
+	}
+}
+
+func printSummary() {
+	s.mu.RLock()
+	totalConns := s.totalConns
+	totalUp := s.totalUp
+	totalDown := s.totalDown
+	s.mu.RUnlock()
+
+	fmt.Print("\033[?25h")
 	fmt.Println()
+	fmt.Println("  ╔═══════════════════════════════════════════════════╗")
+	fmt.Println("  ║               Session Summary                    ║")
+	fmt.Println("  ╠═══════════════════════════════════════════════════╣")
+	fmt.Printf("  ║  Connections : %-34d║\n", totalConns)
+	fmt.Printf("  ║  Uploaded    : %-34s║\n", humanBytes(totalUp))
+	fmt.Printf("  ║  Downloaded  : %-34s║\n", humanBytes(totalDown))
+	fmt.Println("  ╚═══════════════════════════════════════════════════╝")
 }
 
 func isLinkLocal(ip net.IP) bool {
 	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+func isWSL(ipStr string) bool {
+	return strings.HasPrefix(ipStr, "172.16.") || strings.HasPrefix(ipStr, "172.17.") ||
+		strings.HasPrefix(ipStr, "172.18.") || strings.HasPrefix(ipStr, "172.19.") ||
+		strings.HasPrefix(ipStr, "172.20.") || strings.HasPrefix(ipStr, "172.21.") ||
+		strings.HasPrefix(ipStr, "172.22.") || strings.HasPrefix(ipStr, "172.23.") ||
+		strings.HasPrefix(ipStr, "172.24.") || strings.HasPrefix(ipStr, "172.25.") ||
+		strings.HasPrefix(ipStr, "172.26.") || strings.HasPrefix(ipStr, "172.27.") ||
+		strings.HasPrefix(ipStr, "172.28.") || strings.HasPrefix(ipStr, "172.29.") ||
+		strings.HasPrefix(ipStr, "172.30.") || strings.HasPrefix(ipStr, "172.31.")
+}
+
+func isUsefulIP(ip net.IP) bool {
+	ipStr := ip.String()
+	if isLinkLocal(ip) {
+		return false
+	}
+	if isWSL(ipStr) {
+		return false
+	}
+	if strings.HasPrefix(ipStr, "10.") {
+		return true
+	}
+	if strings.HasPrefix(ipStr, "192.168.") {
+		return true
+	}
+	return true
 }
 
 func detectBestIP() string {
@@ -168,127 +251,55 @@ func detectBestIP() string {
 		return "127.0.0.1"
 	}
 
-	var fallback string
+	type candidate struct {
+		ip    string
+		prefs int
+	}
+	var candidates []candidate
+
 	for _, a := range addrs {
 		ipNet, ok := a.(*net.IPNet)
 		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
 			continue
 		}
-		if isLinkLocal(ipNet.IP) {
-			if fallback == "" {
-				fallback = ipNet.IP.String()
-			}
+		if !isUsefulIP(ipNet.IP) {
 			continue
 		}
-		if strings.HasPrefix(ipNet.IP.String(), "10.") ||
-			strings.HasPrefix(ipNet.IP.String(), "192.168.") ||
-			(strings.HasPrefix(ipNet.IP.String(), "172.") && len(ipNet.IP.String()) > 4) {
-			return ipNet.IP.String()
+		ipStr := ipNet.IP.String()
+		prefs := 0
+		if strings.HasPrefix(ipStr, "10.") {
+			prefs = 3
+		} else if strings.HasPrefix(ipStr, "192.168.") {
+			prefs = 2
+		} else {
+			prefs = 1
 		}
-		if fallback == "" {
-			fallback = ipNet.IP.String()
-		}
+		candidates = append(candidates, candidate{ip: ipStr, prefs: prefs})
 	}
 
-	if fallback != "" {
-		return fallback
+	if len(candidates) == 0 {
+		return "127.0.0.1"
 	}
-	return "127.0.0.1"
-}
 
-func listAllIPs() []string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil
-	}
-	var ips []string
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
-			continue
-		}
-		ips = append(ips, ipNet.IP.String())
-	}
-	return ips
-}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].prefs > candidates[j].prefs
+	})
 
-func printStatsLoop() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		printStatsSnapshot()
-	}
-}
-
-func printStatsSnapshot() {
-	s.mu.RLock()
-	active := make([]*connStats, 0, len(s.active))
-	for _, c := range s.active {
-		active = append(active, c)
-	}
-	totalConns := s.totalConns
-	totalUp := s.totalUp
-	totalDown := s.totalDown
-	s.mu.RUnlock()
-
-	fmt.Println()
-	fmt.Printf("── Connections: %d active / %d total ──\n", len(active), totalConns)
-	if len(active) == 0 {
-		fmt.Println("   (no active connections)")
-	} else {
-		fmt.Printf("   %-6s %-8s %-26s %-10s %-10s %-8s\n", "ID", "Client", "Destination", "Upload", "Download", "Time")
-		for _, c := range active {
-			up := humanBytes(c.upload.Load())
-			down := humanBytes(c.download.Load())
-			dur := time.Since(c.start).Round(time.Second)
-			dest := c.dest
-			if len(dest) > 26 {
-				dest = dest[:23] + "..."
-			}
-			clientIP := c.clientIP
-			if len(clientIP) > 8 {
-				clientIP = clientIP[len(clientIP)-7:]
-			}
-			fmt.Printf("   #%-5d %-8s %-26s %-10s %-10s %-8s\n", c.id, clientIP, dest, up, down, dur)
-		}
-	}
-	if totalUp > 0 || totalDown > 0 {
-		fmt.Printf("── Total: ↑%s  ↓%s ──\n", humanBytes(totalUp), humanBytes(totalDown))
-	}
-	fmt.Println()
-}
-
-func printStatsFinal() {
-	s.mu.RLock()
-	totalConns := s.totalConns
-	totalUp := s.totalUp
-	totalDown := s.totalDown
-	s.mu.RUnlock()
-
-	fmt.Println()
-	fmt.Println("╔══════════════════════════════════════════════╗")
-	fmt.Println("║              Session Summary                 ║")
-	fmt.Println("╠══════════════════════════════════════════════╣")
-	fmt.Printf("║  Total Connections : %-22d ║\n", totalConns)
-	fmt.Printf("║  Total Upload      : %-22s ║\n", humanBytes(totalUp))
-	fmt.Printf("║  Total Download    : %-22s ║\n", humanBytes(totalDown))
-	fmt.Println("╚══════════════════════════════════════════════╝")
+	return candidates[0].ip
 }
 
 func handleConn(client net.Conn, id uint64, cfg Config) {
 	defer client.Close()
-	start := time.Now()
 
 	clientAddr := client.RemoteAddr().String()
 	clientHost, _, _ := net.SplitHostPort(clientAddr)
 
 	dest, err := serverHandshake(client, cfg)
 	if err != nil {
-		log.Printf("[#%d] handshake failed from %s: %v", id, clientHost, err)
 		return
 	}
 
-	cs := &connStats{id: id, dest: dest, clientIP: clientHost, start: start}
+	cs := &connStats{id: id, dest: dest, clientIP: clientHost, start: time.Now()}
 	s.mu.Lock()
 	s.active[id] = cs
 	s.totalConns++
@@ -301,33 +312,24 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 		s.mu.Unlock()
 	}()
 
-	log.Printf("[#%d] CONNECT %s (client=%s)", id, dest, clientHost)
-
 	upstream, err := net.DialTimeout("tcp", cfg.Upstream, 10*time.Second)
 	if err != nil {
-		log.Printf("[#%d] upstream dial failed: %v", id, err)
 		return
 	}
 	defer upstream.Close()
 
 	if err := clientHandshake(upstream, dest, cfg); err != nil {
-		log.Printf("[#%d] upstream handshake failed: %v", id, err)
 		return
 	}
 
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	up, down := relay(client, upstream, cs)
-	log.Printf("[#%d] done | ↑%s ↓%s %v",
-		id, humanBytes(up), humanBytes(down), time.Since(start).Round(time.Millisecond))
+	relay(client, upstream, cs)
 }
-
-// ─── SOCKS5 Server Handshake ───────────────────────────────────────────────
 
 func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 	buf := make([]byte, 258)
 
-	// VER | NMETHODS | METHODS
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return "", err
 	}
@@ -342,7 +344,6 @@ func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 	needAuth := cfg.Username != ""
 	method := selectMethod(buf[:nMethods], needAuth)
 
-	// VER | METHOD
 	if _, err := conn.Write([]byte{0x05, method}); err != nil {
 		return "", err
 	}
@@ -353,12 +354,11 @@ func serverHandshake(conn net.Conn, cfg Config) (string, error) {
 		}
 	}
 
-	// VER | CMD | RSV | ATYP | ADDR... | PORT(2)
 	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 		return "", err
 	}
-	if buf[1] != 0x01 { // only CONNECT
-		conn.Write(socksReply(0x07, nil))
+	if buf[1] != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return "", fmt.Errorf("cmd %d not supported", buf[1])
 	}
 	addr, err := readAddr(buf[3], conn)
@@ -382,24 +382,24 @@ func selectMethod(methods []byte, needAuth bool) byte {
 			return 0x00
 		}
 	}
-	return 0x00 // best effort
+	return 0x00
 }
 
 func authServer(conn net.Conn, cfg Config) error {
 	var buf [513]byte
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil { // VER | ULEN
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return err
 	}
 	uLen := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:uLen]); err != nil { // UNAME
+	if _, err := io.ReadFull(conn, buf[:uLen]); err != nil {
 		return err
 	}
 	username := string(buf[:uLen])
-	if _, err := io.ReadFull(conn, buf[:1]); err != nil { // PLEN
+	if _, err := io.ReadFull(conn, buf[:1]); err != nil {
 		return err
 	}
 	pLen := int(buf[0])
-	if _, err := io.ReadFull(conn, buf[:pLen]); err != nil { // PASSWD
+	if _, err := io.ReadFull(conn, buf[:pLen]); err != nil {
 		return err
 	}
 	password := string(buf[:pLen])
@@ -415,13 +415,13 @@ func authServer(conn net.Conn, cfg Config) error {
 func readAddr(atyp byte, conn net.Conn) (string, error) {
 	var host string
 	switch atyp {
-	case 0x01: // IPv4
+	case 0x01:
 		buf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			return "", err
 		}
 		host = net.IP(buf).String()
-	case 0x03: // Domain
+	case 0x03:
 		var dLen uint8
 		if err := binary.Read(conn, binary.BigEndian, &dLen); err != nil {
 			return "", err
@@ -431,7 +431,7 @@ func readAddr(atyp byte, conn net.Conn) (string, error) {
 			return "", err
 		}
 		host = string(buf)
-	case 0x04: // IPv6
+	case 0x04:
 		buf := make([]byte, 16)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			return "", err
@@ -449,32 +449,11 @@ func readAddr(atyp byte, conn net.Conn) (string, error) {
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
-func socksReply(rep byte, bind net.Addr) []byte {
-	reply := make([]byte, 10) // VER RSV ATYP(0x01) IP(4) PORT(2)
-	reply[0] = 0x05
-	reply[1] = rep
-	reply[2] = 0x00
-	reply[3] = 0x01 // IPv4
-	// bytes 4-7 = 0.0.0.0
-	if bind != nil {
-		if tcpAddr, ok := bind.(*net.TCPAddr); ok {
-			copy(reply[4:8], tcpAddr.IP.To4())
-			binary.BigEndian.PutUint16(reply[8:10], uint16(tcpAddr.Port))
-		}
-	}
-	return reply
-}
-
-// ─── SOCKS5 Client Handshake (connect to upstream) ────────────────────────
-
 func clientHandshake(conn net.Conn, dest string, cfg Config) error {
-	// Send: VER | NMETHODS | METHODS
-	// We support no-auth (0x00) to upstream
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return err
 	}
 
-	// Read: VER | METHOD
 	var resp [2]byte
 	if _, err := io.ReadFull(conn, resp[:]); err != nil {
 		return err
@@ -482,13 +461,10 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	if resp[0] != 0x05 {
 		return fmt.Errorf("upstream version %d", resp[1])
 	}
-
-	// Upstream typically doesn't require auth; skip if method is 0x00
 	if resp[1] != 0x00 {
 		return fmt.Errorf("upstream requested unsupported method: %d", resp[1])
 	}
 
-	// Build CONNECT request
 	host, portStr, err := net.SplitHostPort(dest)
 	if err != nil {
 		return err
@@ -496,7 +472,7 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	var port uint16
 	fmt.Sscanf(portStr, "%d", &port)
 
-	req := []byte{0x05, 0x01, 0x00} // VER CMD RSV
+	req := []byte{0x05, 0x01, 0x00}
 
 	ip := net.ParseIP(host)
 	if ip4 := ip.To4(); ip4 != nil {
@@ -506,7 +482,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 		req = append(req, 0x04)
 		req = append(req, ip6...)
 	} else {
-		// Domain
 		req = append(req, 0x03)
 		req = append(req, byte(len(host)))
 		req = append(req, host...)
@@ -520,7 +495,6 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 		return err
 	}
 
-	// Read reply
 	var reply [10]byte
 	if _, err := io.ReadFull(conn, reply[:4]); err != nil {
 		return err
@@ -528,28 +502,8 @@ func clientHandshake(conn net.Conn, dest string, cfg Config) error {
 	if reply[1] != 0x00 {
 		return fmt.Errorf("upstream CONNECT failed: %d", reply[1])
 	}
-	// Skip the rest of the reply (address)
 	skipAddr(reply[3], conn)
 
-	return nil
-}
-
-func authClient(conn net.Conn, cfg Config) error {
-	msg := []byte{0x01}
-	msg = append(msg, byte(len(cfg.Username)))
-	msg = append(msg, cfg.Username...)
-	msg = append(msg, byte(len(cfg.Password)))
-	msg = append(msg, cfg.Password...)
-	if _, err := conn.Write(msg); err != nil {
-		return err
-	}
-	var resp [2]byte
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return err
-	}
-	if resp[1] != 0x00 {
-		return fmt.Errorf("upstream auth rejected")
-	}
 	return nil
 }
 
@@ -566,12 +520,10 @@ func skipAddr(atyp byte, conn net.Conn) {
 	}
 }
 
-// ─── Relay ──────────────────────────────────────────────────────────────────
-
 type countedConn struct {
 	net.Conn
-	cs     *connStats
-	isUp   bool
+	cs   *connStats
+	isUp bool
 }
 
 func (c *countedConn) Read(p []byte) (int, error) {
@@ -584,16 +536,20 @@ func (c *countedConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func relay(a, b net.Conn, cs *connStats) (up, down int64) {
+func relay(a, b net.Conn, cs *connStats) (int64, int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	var up, down int64
 
 	go func() {
 		defer wg.Done()
 		cc := &countedConn{Conn: a, cs: cs, isUp: true}
 		n, _ := io.Copy(b, cc)
 		up = n
-		setCloseWrite(b)
+		if tc, ok := b.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}()
 
 	go func() {
@@ -601,17 +557,13 @@ func relay(a, b net.Conn, cs *connStats) (up, down int64) {
 		cc := &countedConn{Conn: b, cs: cs, isUp: false}
 		n, _ := io.Copy(a, cc)
 		down = n
-		setCloseWrite(a)
+		if tc, ok := a.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}()
 
 	wg.Wait()
-	return
-}
-
-func setCloseWrite(conn net.Conn) {
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.CloseWrite()
-	}
+	return up, down
 }
 
 func humanBytes(b int64) string {
