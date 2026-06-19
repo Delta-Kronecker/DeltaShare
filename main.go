@@ -84,8 +84,8 @@ func main() {
 		SetFixed(1, 0)
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(infoText, 0, 1, false).
-		AddItem(connTable, 0, 2, false)
+		AddItem(infoText, 14, 0, false).
+		AddItem(connTable, 0, 1, false)
 
 	app.SetRoot(flex, true)
 

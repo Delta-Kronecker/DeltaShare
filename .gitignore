@@ -1,3 +1,8 @@
 deltashare
 deltashare.exe
 main_test.go
+*.sh
+*.ps1
+*.bat
+*.py
+.mimocode/
