@@ -138,9 +138,9 @@ func main() {
 }
 
 func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
-	auth := "[gray]off[white]"
+	auth := "[#FF6B6B]off[#FFFFFF]"
 	if cfg.Username != "" {
-		auth = "[green]on[white]"
+		auth = "[#6BCB77]on[#FFFFFF]"
 	}
 
 	s.mu.RLock()
@@ -156,16 +156,16 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", ip, port)
 
 	tv.Clear()
-	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.3\n\n")
-	fmt.Fprintf(tv, "[gray]Address    [white]%s:%s\n", ip, port)
-	fmt.Fprintf(tv, "[gray]Upstream   [gray]%s\n", cfg.Upstream)
-	fmt.Fprintf(tv, "[gray]Auth       %s\n", auth)
-	fmt.Fprintf(tv, "[gray]Uptime     [green]%s\n\n", uptime)
-	fmt.Fprintf(tv, "[gray]Telegram   [white]%s\n", telegramLink)
-	fmt.Fprintf(tv, "[gray]V2RayNG    [white]%s\n\n", v2rayLink)
-	fmt.Fprintf(tv, "[gray]Upload     [cyan]%s\n", humanBytes(totalUp))
-	fmt.Fprintf(tv, "[gray]Download   [cyan]%s\n", humanBytes(totalDown))
-	fmt.Fprintf(tv, "[gray]Active     [green]%d[gray]   Total [white]%d", activeCount, totalConns)
+	fmt.Fprintf(tv, "[#FFD93D]■ [#FFFFFF]DeltaShare [#888888]v0.7.0\n\n")
+	fmt.Fprintf(tv, "[#CCCCCC]Address    [#FFFFFF]%s:%s\n", ip, port)
+	fmt.Fprintf(tv, "[#CCCCCC]Upstream   [#AAAAAA]%s\n", cfg.Upstream)
+	fmt.Fprintf(tv, "[#CCCCCC]Auth       %s\n", auth)
+	fmt.Fprintf(tv, "[#CCCCCC]Uptime     [#6BCB77]%s\n\n", uptime)
+	fmt.Fprintf(tv, "[#CCCCCC]Telegram   [#5DADE2]%s\n", telegramLink)
+	fmt.Fprintf(tv, "[#CCCCCC]V2RayNG    [#5DADE2]%s\n\n", v2rayLink)
+	fmt.Fprintf(tv, "[#CCCCCC]Upload     [#FFD93D]%s\n", humanBytes(totalUp))
+	fmt.Fprintf(tv, "[#CCCCCC]Download   [#FFD93D]%s\n", humanBytes(totalDown))
+	fmt.Fprintf(tv, "[#CCCCCC]Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d", activeCount, totalConns)
 }
 
 func updateTable(table *tview.Table) {
@@ -185,7 +185,7 @@ func updateTable(table *tview.Table) {
 	headers := []string{"ID", "Destination", "Upload", "Download", "Time"}
 	for c, h := range headers {
 		cell := tview.NewTableCell(h).
-			SetTextColor(tcellColor(tview.Styles.SecondaryTextColor)).
+			SetTextColor(tcell.GetColor("#FFD93D")).
 			SetSelectable(false).
 			SetExpansion(1)
 		table.SetCell(0, c, cell)
@@ -207,10 +207,6 @@ func updateTable(table *tview.Table) {
 		table.SetCell(row, 3, tview.NewTableCell(down).SetExpansion(1))
 		table.SetCell(row, 4, tview.NewTableCell(dur).SetExpansion(1))
 	}
-}
-
-func tcellColor(c tcell.Color) tcell.Color {
-	return c
 }
 
 func isLinkLocal(ip net.IP) bool {
