@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +27,7 @@ type Config struct {
 type connStats struct {
 	id       uint64
 	dest     string
+	clientIP string
 	start    time.Time
 	upload   atomic.Int64
 	download atomic.Int64
@@ -52,18 +54,7 @@ func main() {
 	flag.StringVar(&cfg.Password, "pass", "", "Password for client auth")
 	flag.Parse()
 
-	publicIP := cfg.PublicIP
-	if publicIP == "" {
-		publicIP = detectPublicIP()
-	}
-	if publicIP == "" {
-		publicIP = "127.0.0.1"
-	}
-
-	_, port, _ := net.SplitHostPort(cfg.ListenAddr)
-	if port == "" {
-		port = "7373"
-	}
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -71,7 +62,22 @@ func main() {
 	}
 	defer ln.Close()
 
-	printBanner(publicIP, port, cfg)
+	actualAddr := ln.Addr().String()
+	_, port, _ := net.SplitHostPort(actualAddr)
+	if port == "" {
+		port = "7373"
+	}
+
+	var displayIP string
+	if cfg.PublicIP != "" {
+		displayIP = cfg.PublicIP
+	} else {
+		displayIP = detectBestIP()
+	}
+
+	printBanner(displayIP, port, cfg, actualAddr)
+
+	log.Printf("Listening on %s", actualAddr)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -98,6 +104,8 @@ func main() {
 		}
 		connID++
 		id := connID
+		clientAddr := conn.RemoteAddr().String()
+		log.Printf("[#%d] accepted from %s", id, clientAddr)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -110,36 +118,98 @@ func main() {
 	log.Println("DeltaShare stopped")
 }
 
-func printBanner(publicIP, port string, cfg Config) {
+func printBanner(ip, port string, cfg Config, listenAddr string) {
+	version := "v0.2.0"
 	fmt.Println()
-	fmt.Println("╔══════════════════════════════════════════════╗")
-	fmt.Println("║            DeltaShare v0.1.0-beta            ║")
-	fmt.Println("╠══════════════════════════════════════════════╣")
-	fmt.Printf("║  SOCKS5 Address : %-27s ║\n", publicIP+":"+port)
+	fmt.Println("╔════════════════════════════════════════════════════╗")
+	fmt.Printf("║              DeltaShare %-24s║\n", version)
+	fmt.Println("╠════════════════════════════════════════════════════╣")
+	fmt.Printf("║  Listening on  : %-32s║\n", listenAddr)
+	fmt.Printf("║  SOCKS5 Proxy  : %-32s║\n", ip+":"+port)
 	if cfg.Username != "" {
-		fmt.Printf("║  Auth           : %-27s ║\n", "enabled")
+		fmt.Printf("║  Auth          : %-32s║\n", "enabled (username/password)")
 	} else {
-		fmt.Printf("║  Auth           : %-27s ║\n", "disabled")
+		fmt.Printf("║  Auth          : %-32s║\n", "disabled")
 	}
-	fmt.Printf("║  Upstream       : %-27s ║\n", cfg.Upstream)
-	fmt.Println("╠══════════════════════════════════════════════╣")
-	fmt.Println("║  Connect with:                               ║")
-	fmt.Printf("║  curl --socks5 %s:%s https://example.com  ║\n", publicIP, port)
-	fmt.Println("╚══════════════════════════════════════════════╝")
+	fmt.Printf("║  Upstream      : %-32s║\n", cfg.Upstream)
+
+	allIPs := listAllIPs()
+	if len(allIPs) > 0 {
+		fmt.Println("╠════════════════════════════════════════════════════╣")
+		fmt.Println("║  Available addresses:                              ║")
+		for _, a := range allIPs {
+			if a == ip {
+				fmt.Printf("║    * %s:%s (recommended)\n", a, port)
+			} else {
+				fmt.Printf("║      %s:%s\n", a, port)
+			}
+		}
+	}
+
+	fmt.Println("╠════════════════════════════════════════════════════╣")
+	fmt.Println("║  Example (Telegram):                               ║")
+	fmt.Printf("║    SOCKS5: %s:%-21s║\n", ip, port)
+	fmt.Println("║  Example (V2RayNG):                                ║")
+	fmt.Printf("║    Address: %-36s║\n", ip)
+	fmt.Printf("║    Port   : %-36s║\n", port)
+	fmt.Println("║  Example (curl):                                   ║")
+	fmt.Printf("║    curl --socks5 %s:%s https://example.com   ║\n", ip, port)
+	fmt.Println("╚════════════════════════════════════════════════════╝")
 	fmt.Println()
 }
 
-func detectPublicIP() string {
+func isLinkLocal(ip net.IP) bool {
+	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+func detectBestIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return ""
+		return "127.0.0.1"
 	}
+
+	var fallback string
 	for _, a := range addrs {
-		if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+			continue
+		}
+		if isLinkLocal(ipNet.IP) {
+			if fallback == "" {
+				fallback = ipNet.IP.String()
+			}
+			continue
+		}
+		if strings.HasPrefix(ipNet.IP.String(), "10.") ||
+			strings.HasPrefix(ipNet.IP.String(), "192.168.") ||
+			(strings.HasPrefix(ipNet.IP.String(), "172.") && len(ipNet.IP.String()) > 4) {
 			return ipNet.IP.String()
 		}
+		if fallback == "" {
+			fallback = ipNet.IP.String()
+		}
 	}
-	return ""
+
+	if fallback != "" {
+		return fallback
+	}
+	return "127.0.0.1"
+}
+
+func listAllIPs() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+			continue
+		}
+		ips = append(ips, ipNet.IP.String())
+	}
+	return ips
 }
 
 func printStatsLoop() {
@@ -166,16 +236,20 @@ func printStatsSnapshot() {
 	if len(active) == 0 {
 		fmt.Println("   (no active connections)")
 	} else {
-		fmt.Printf("   %-6s %-30s %-10s %-10s %-8s\n", "ID", "Destination", "Upload", "Download", "Time")
+		fmt.Printf("   %-6s %-8s %-26s %-10s %-10s %-8s\n", "ID", "Client", "Destination", "Upload", "Download", "Time")
 		for _, c := range active {
 			up := humanBytes(c.upload.Load())
 			down := humanBytes(c.download.Load())
 			dur := time.Since(c.start).Round(time.Second)
 			dest := c.dest
-			if len(dest) > 30 {
-				dest = dest[:27] + "..."
+			if len(dest) > 26 {
+				dest = dest[:23] + "..."
 			}
-			fmt.Printf("   #%-5d %-30s %-10s %-10s %-8s\n", c.id, dest, up, down, dur)
+			clientIP := c.clientIP
+			if len(clientIP) > 8 {
+				clientIP = clientIP[len(clientIP)-7:]
+			}
+			fmt.Printf("   #%-5d %-8s %-26s %-10s %-10s %-8s\n", c.id, clientIP, dest, up, down, dur)
 		}
 	}
 	if totalUp > 0 || totalDown > 0 {
@@ -205,13 +279,16 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 	defer client.Close()
 	start := time.Now()
 
+	clientAddr := client.RemoteAddr().String()
+	clientHost, _, _ := net.SplitHostPort(clientAddr)
+
 	dest, err := serverHandshake(client, cfg)
 	if err != nil {
-		log.Printf("[#%d] handshake: %v", id, err)
+		log.Printf("[#%d] handshake failed from %s: %v", id, clientHost, err)
 		return
 	}
 
-	cs := &connStats{id: id, dest: dest, start: start}
+	cs := &connStats{id: id, dest: dest, clientIP: clientHost, start: start}
 	s.mu.Lock()
 	s.active[id] = cs
 	s.totalConns++
@@ -224,17 +301,17 @@ func handleConn(client net.Conn, id uint64, cfg Config) {
 		s.mu.Unlock()
 	}()
 
-	log.Printf("[#%d] CONNECT %s", id, dest)
+	log.Printf("[#%d] CONNECT %s (client=%s)", id, dest, clientHost)
 
 	upstream, err := net.DialTimeout("tcp", cfg.Upstream, 10*time.Second)
 	if err != nil {
-		log.Printf("[#%d] upstream dial: %v", id, err)
+		log.Printf("[#%d] upstream dial failed: %v", id, err)
 		return
 	}
 	defer upstream.Close()
 
 	if err := clientHandshake(upstream, dest, cfg); err != nil {
-		log.Printf("[#%d] upstream handshake: %v", id, err)
+		log.Printf("[#%d] upstream handshake failed: %v", id, err)
 		return
 	}
 
@@ -491,23 +568,39 @@ func skipAddr(atyp byte, conn net.Conn) {
 
 // ─── Relay ──────────────────────────────────────────────────────────────────
 
+type countedConn struct {
+	net.Conn
+	cs     *connStats
+	isUp   bool
+}
+
+func (c *countedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.isUp {
+		c.cs.upload.Add(int64(n))
+	} else if n > 0 {
+		c.cs.download.Add(int64(n))
+	}
+	return n, err
+}
+
 func relay(a, b net.Conn, cs *connStats) (up, down int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(b, a)
+		cc := &countedConn{Conn: a, cs: cs, isUp: true}
+		n, _ := io.Copy(b, cc)
 		up = n
-		cs.upload.Store(n)
 		setCloseWrite(b)
 	}()
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(a, b)
+		cc := &countedConn{Conn: b, cs: cs, isUp: false}
+		n, _ := io.Copy(a, cc)
 		down = n
-		cs.download.Store(n)
 		setCloseWrite(a)
 	}()
 
