@@ -156,7 +156,7 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", ip, port)
 
 	tv.Clear()
-	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.2\n\n")
+	fmt.Fprintf(tv, "[yellow]■ [white]DeltaShare [gray]v0.6.3\n\n")
 	fmt.Fprintf(tv, "[gray]Address    [white]%s:%s\n", ip, port)
 	fmt.Fprintf(tv, "[gray]Upstream   [gray]%s\n", cfg.Upstream)
 	fmt.Fprintf(tv, "[gray]Auth       %s\n", auth)
