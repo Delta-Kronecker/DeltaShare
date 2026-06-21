@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
-	"sort"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +48,7 @@ type stats struct {
 
 var s = &stats{active: make(map[uint64]*connStats)}
 var startTime time.Time
+var restartConfig *Config
 
 func main() {
 	cfg := Config{}
@@ -54,95 +58,132 @@ func main() {
 	flag.StringVar(&cfg.Username, "user", "", "Username for auth")
 	flag.StringVar(&cfg.Password, "pass", "", "Password for auth")
 	flag.Parse()
-	startTime = time.Now()
 
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	actualAddr := ln.Addr().String()
-	_, port, _ := net.SplitHostPort(actualAddr)
-	if port == "" {
-		port = "7373"
-	}
-
-	displayIP := cfg.PublicIP
-	if displayIP == "" {
-		displayIP = detectBestIP()
-	}
-
-	currentPort := &port
-
-	app := tview.NewApplication()
-
-	infoText := tview.NewTextView().
-		SetDynamicColors(true).
-		SetRegions(true)
-
-	connTable := tview.NewTable().
-		SetSelectable(false, false).
-		SetFixed(1, 0)
-
-	flex := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(infoText, 14, 0, false).
-		AddItem(connTable, 0, 1, false)
-	flex.SetTitle(" DeltaShare ").SetBorder(true).
-		SetTitleColor(tcell.GetColor("#5DADE2")).
-		SetBorderColor(tcell.GetColor("#5DADE2"))
-
-	app.SetRoot(flex, true)
-
-	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Rune() == 's' || event.Rune() == 'S' {
-			showSettings(app, flex, infoText, connTable, &cfg, currentPort, displayIP)
-			return nil
+	for {
+		if restartConfig != nil {
+			cfg = *restartConfig
+			restartConfig = nil
 		}
-		if event.Rune() == 'q' || event.Rune() == 'Q' {
-			app.Stop()
-			return nil
+		startTime = time.Now()
+		ln, err := net.Listen("tcp", cfg.ListenAddr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "listen failed: %v\n", err)
+			os.Exit(1)
 		}
-		return event
-	})
-
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			app.QueueUpdateDraw(func() {
-				updateInfo(infoText, displayIP, *currentPort, cfg)
-				updateTable(connTable)
-			})
+		actualAddr := ln.Addr().String()
+		_, port, _ := net.SplitHostPort(actualAddr)
+		if port == "" {
+			port = "7373"
 		}
-	}()
+		publicIP := cfg.PublicIP
+		currentPort := &port
 
-	go func() {
-		var wg sync.WaitGroup
-		var connID uint64
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-					break
-				}
-				continue
-			}
-			connID++
-			id := connID
-			wg.Add(1)
+		app := tview.NewApplication()
+
+		infoText := tview.NewTextView().
+			SetDynamicColors(true).
+			SetRegions(true)
+
+		headerLeft := tview.NewTextView().SetDynamicColors(true).
+			SetText("[#FFD93D]■ [#FFFFFF]DeltaShare [#888888]v0.8.0")
+		headerLeft.SetBackgroundColor(tcell.NewRGBColor(15, 15, 25))
+		headerRight := tview.NewTextView().SetDynamicColors(true).
+			SetText("[#666666]press s for settings").
+			SetTextAlign(tview.AlignRight)
+		headerRight.SetBackgroundColor(tcell.NewRGBColor(15, 15, 25))
+
+		headerRow := tview.NewFlex().
+			AddItem(headerLeft, 0, 1, false).
+			AddItem(headerRight, 0, 1, false)
+
+		connTable := tview.NewTable().
+			SetSelectable(false, false).
+			SetFixed(1, 0)
+
+		flex := tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(headerRow, 1, 0, false).
+			AddItem(infoText, 0, 1, false).
+			AddItem(connTable, 0, 1, false)
+		flex.SetTitle(" DeltaShare ").SetBorder(true).
+			SetTitleColor(tcell.GetColor("#5DADE2")).
+			SetBorderColor(tcell.GetColor("#5DADE2"))
+
+		app.SetRoot(flex, true)
+
+		if publicIP == "" {
+			publicIP = "..."
+			updateInfo(infoText, publicIP, *currentPort, cfg)
 			go func() {
-				defer wg.Done()
-				handleConn(conn, id, cfg)
+				ip := detectPublicIP()
+				if ip != "" {
+					publicIP = ip
+				} else {
+					publicIP = "unknown"
+				}
+				app.QueueUpdateDraw(func() {
+					updateInfo(infoText, publicIP, *currentPort, cfg)
+				})
 			}()
+		} else {
+			updateInfo(infoText, publicIP, *currentPort, cfg)
 		}
-		wg.Wait()
-		app.Stop()
-	}()
 
-	if err := app.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "UI error: %v\n", err)
-		os.Exit(1)
+		app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			if event.Rune() == 's' || event.Rune() == 'S' {
+				showSettings(app, flex, infoText, connTable, &cfg, currentPort, publicIP)
+				return nil
+			}
+			if event.Rune() == 'q' || event.Rune() == 'Q' {
+				app.Stop()
+				return nil
+			}
+			return event
+		})
+
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				app.QueueUpdateDraw(func() {
+					updateInfo(infoText, publicIP, *currentPort, cfg)
+					updateTable(connTable)
+				})
+			}
+		}()
+
+		go func() {
+			var wg sync.WaitGroup
+			var connID uint64
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+						break
+					}
+					continue
+				}
+				connID++
+				id := connID
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					handleConn(conn, id, cfg)
+				}()
+			}
+			wg.Wait()
+			app.Stop()
+		}()
+
+		if err := app.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "UI error: %v\n", err)
+			os.Exit(1)
+		}
+
+		ln.Close()
+
+		if restartConfig == nil {
+			break
+		}
 	}
 
 	s.mu.RLock()
@@ -154,75 +195,81 @@ func main() {
 	s.mu.RUnlock()
 }
 
-func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.TextView, connTable *tview.Table, cfg *Config, currentPort *string, displayIP string) {
-	portField := tview.NewInputField().SetLabel("Port      ").SetText(*currentPort).SetFieldWidth(5)
-	userField := tview.NewInputField().SetLabel("Username  ").SetText(cfg.Username).SetFieldWidth(20)
-	passField := tview.NewInputField().SetLabel("Password  ").SetText(cfg.Password).SetFieldWidth(20).SetMaskCharacter('*')
-	upstreamField := tview.NewInputField().SetLabel("Upstream  ").SetText(cfg.Upstream).SetFieldWidth(30)
+func showSettings(app *tview.Application, flex *tview.Flex, infoText *tview.TextView, connTable *tview.Table, cfg *Config, currentPort *string, publicIP string) {
+	fields := []*tview.InputField{
+		tview.NewInputField().SetLabel("Port      ").SetText(*currentPort).SetFieldWidth(5),
+		tview.NewInputField().SetLabel("Username  ").SetText(cfg.Username).SetFieldWidth(20),
+		tview.NewInputField().SetLabel("Password  ").SetText(cfg.Password).SetFieldWidth(20).SetMaskCharacter('*'),
+		tview.NewInputField().SetLabel("Upstream  ").SetText(cfg.Upstream).SetFieldWidth(30),
+	}
+	fieldIdx := 0
 
-	restoreMain := func() {
-		app.SetRoot(flex, true)
-		app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			if event.Rune() == 's' || event.Rune() == 'S' {
-				showSettings(app, flex, infoText, connTable, cfg, currentPort, displayIP)
-				return nil
-			}
-			if event.Rune() == 'q' || event.Rune() == 'Q' {
-				app.Stop()
-				return nil
-			}
-			return event
-		})
-		app.QueueUpdateDraw(func() {
-			updateInfo(infoText, displayIP, *currentPort, *cfg)
-		})
+	saveAndExit := func() {
+		newCfg := *cfg
+		newCfg.Username = fields[1].GetText()
+		newCfg.Password = fields[2].GetText()
+		if fields[3].GetText() != "" {
+			newCfg.Upstream = fields[3].GetText()
+		}
+		newPort := fields[0].GetText()
+		if newPort != "" {
+			newCfg.ListenAddr = ":" + newPort
+		}
+		restartConfig = &newCfg
+		app.Stop()
 	}
 
-	form := tview.NewForm().
-		AddFormItem(portField).
-		AddFormItem(userField).
-		AddFormItem(passField).
-		AddFormItem(upstreamField).
-		AddButton("Save", func() {
-			cfg.Username = userField.GetText()
-			cfg.Password = passField.GetText()
-			if upstreamField.GetText() != "" {
-				cfg.Upstream = upstreamField.GetText()
-			}
-			*currentPort = portField.GetText()
-			restoreMain()
-		}).
-		AddButton("Cancel", restoreMain)
+	form := tview.NewForm()
+	for _, f := range fields {
+		form.AddFormItem(f)
+	}
 
 	form.SetTitle(" Settings [ESC] ").SetBorder(true)
 	form.SetTitleColor(tcell.GetColor("#FFD93D"))
 	form.SetBorderColor(tcell.GetColor("#FFD93D"))
 	form.SetBackgroundColor(tcell.NewRGBColor(15, 15, 25))
+	form.SetFieldBackgroundColor(tcell.NewRGBColor(30, 30, 45))
+	form.SetFieldTextColor(tcell.GetColor("#FFFFFF"))
+	form.SetLabelColor(tcell.GetColor("#CCCCCC"))
 
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			restoreMain()
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyUp:
+			if fieldIdx > 0 {
+				fieldIdx--
+				app.SetFocus(fields[fieldIdx])
+			}
+			return nil
+		case tcell.KeyDown:
+			if fieldIdx < len(fields)-1 {
+				fieldIdx++
+				app.SetFocus(fields[fieldIdx])
+			}
+			return nil
+		case tcell.KeyEnter:
+			saveAndExit()
+			return nil
+		case tcell.KeyEscape:
+			c := *cfg
+			restartConfig = &c
+			app.Stop()
 			return nil
 		}
 		return event
 	})
 
 	hintText := tview.NewTextView().SetDynamicColors(true).
-		SetText("[#888888][#5DADE2]Up/Down[#888888] navigate  [#5DADE2]Tab[#888888] next field  [#5DADE2]Enter[#888888] save  [#FFD93D]ESC[#888888] cancel")
+		SetText("[#888888]Up/Down : navigate     Enter : save      ESC : cancel")
 
 	layout := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(form, 0, 1, true).
 		AddItem(hintText, 1, 0, false)
 
 	app.SetRoot(layout, true)
+	app.SetFocus(fields[0])
 }
 
-func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
-	auth := "[#FF6B6B]off[#FFFFFF]"
-	if cfg.Username != "" {
-		auth = "[#6BCB77]on[#FFFFFF]"
-	}
-
+func updateInfo(tv *tview.TextView, publicIP, port string, cfg Config) {
 	s.mu.RLock()
 	totalUp := s.totalUp
 	totalDown := s.totalDown
@@ -231,22 +278,21 @@ func updateInfo(tv *tview.TextView, ip, port string, cfg Config) {
 	s.mu.RUnlock()
 
 	uptime := formatDuration(time.Since(startTime))
-
-	telegramLink := fmt.Sprintf("https://t.me/socks?server=%s&port=%s", ip, port)
-	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", ip, port)
+	v2rayLink := fmt.Sprintf("socks://%s:%s#DeltaShare", publicIP, port)
+	if cfg.Username != "" {
+		cred := base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
+		v2rayLink = fmt.Sprintf("socks://%s@%s:%s#DeltaShare", cred, publicIP, port)
+	}
 
 	tv.Clear()
-	fmt.Fprintf(tv, "[#FFD93D]■ [#FFFFFF]DeltaShare [#888888]v0.8.0\n\n")
-	fmt.Fprintf(tv, "[#CCCCCC]Address    [#FFFFFF]%s:%s\n", ip, port)
-	fmt.Fprintf(tv, "[#CCCCCC]Upstream   [#AAAAAA]%s\n", cfg.Upstream)
-	fmt.Fprintf(tv, "[#CCCCCC]Auth       %s\n", auth)
-	fmt.Fprintf(tv, "[#CCCCCC]Uptime     [#6BCB77]%s\n\n", uptime)
-	fmt.Fprintf(tv, "[#CCCCCC]Telegram   [#5DADE2]%s\n", telegramLink)
-	fmt.Fprintf(tv, "[#CCCCCC]V2RayNG    [#5DADE2]%s\n\n", v2rayLink)
-	fmt.Fprintf(tv, "[#CCCCCC]Upload     [#FFD93D]%s\n", humanBytes(totalUp))
-	fmt.Fprintf(tv, "[#CCCCCC]Download   [#FFD93D]%s\n", humanBytes(totalDown))
-	fmt.Fprintf(tv, "[#CCCCCC]Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d\n\n", activeCount, totalConns)
-	fmt.Fprintf(tv, "[#5DADE2][S] Settings    [#FFFFFF][Q] Quit")
+	fmt.Fprintf(tv, "[#CCCCCC] Address    [#FFFFFF]%s:%s\n", publicIP, port)
+	fmt.Fprintf(tv, "[#CCCCCC] Uptime     [#6BCB77]%s\n\n", uptime)
+	fmt.Fprintf(tv, "[#FFD93D] V2RayNG\n")
+	fmt.Fprintf(tv, "[#5DADE2] %s\n\n", v2rayLink)
+	fmt.Fprintf(tv, "[#CCCCCC] Upload     [#FFD93D]%s\n", humanBytes(totalUp))
+	fmt.Fprintf(tv, "[#CCCCCC] Download   [#FFD93D]%s\n", humanBytes(totalDown))
+	fmt.Fprintf(tv, "[#CCCCCC] Active     [#6BCB77]%d[#CCCCCC]   Total [#FFFFFF]%d\n\n", activeCount, totalConns)
+	fmt.Fprintf(tv, " [#5DADE2][S] Settings    [#FFFFFF][Q] Quit")
 }
 
 func updateTable(table *tview.Table) {
@@ -263,7 +309,7 @@ func updateTable(table *tview.Table) {
 
 	table.Clear()
 
-	headers := []string{"ID", "Destination", "Upload", "Download", "Time"}
+	headers := []string{"ID", "Upload", "Download", "Time"}
 	for c, h := range headers {
 		cell := tview.NewTableCell(h).
 			SetTextColor(tcell.GetColor("#FFD93D")).
@@ -277,72 +323,54 @@ func updateTable(table *tview.Table) {
 		up := humanBytes(cs.upload.Load())
 		down := humanBytes(cs.download.Load())
 		dur := formatDuration(time.Since(cs.start))
-		dest := cs.dest
-		if len(dest) > 30 {
-			dest = dest[:27] + "..."
-		}
 
 		table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf("#%d", cs.id)).SetExpansion(1))
-		table.SetCell(row, 1, tview.NewTableCell(dest).SetExpansion(3))
-		table.SetCell(row, 2, tview.NewTableCell(up).SetExpansion(1))
-		table.SetCell(row, 3, tview.NewTableCell(down).SetExpansion(1))
-		table.SetCell(row, 4, tview.NewTableCell(dur).SetExpansion(1))
+		table.SetCell(row, 1, tview.NewTableCell(up).SetExpansion(1))
+		table.SetCell(row, 2, tview.NewTableCell(down).SetExpansion(1))
+		table.SetCell(row, 3, tview.NewTableCell(dur).SetExpansion(1))
 	}
 }
 
-func isLinkLocal(ip net.IP) bool {
-	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
-}
 
-func isWSL(ipStr string) bool {
-	return strings.HasPrefix(ipStr, "172.") && (strings.HasPrefix(ipStr, "172.16.") ||
-		strings.HasPrefix(ipStr, "172.17.") || strings.HasPrefix(ipStr, "172.18.") ||
-		strings.HasPrefix(ipStr, "172.19.") || strings.HasPrefix(ipStr, "172.20.") ||
-		strings.HasPrefix(ipStr, "172.21.") || strings.HasPrefix(ipStr, "172.22.") ||
-		strings.HasPrefix(ipStr, "172.23.") || strings.HasPrefix(ipStr, "172.24.") ||
-		strings.HasPrefix(ipStr, "172.25.") || strings.HasPrefix(ipStr, "172.26.") ||
-		strings.HasPrefix(ipStr, "172.27.") || strings.HasPrefix(ipStr, "172.28.") ||
-		strings.HasPrefix(ipStr, "172.29.") || strings.HasPrefix(ipStr, "172.30.") ||
-		strings.HasPrefix(ipStr, "172.31."))
-}
-
-func detectBestIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return "127.0.0.1"
+func detectPublicIP() string {
+	type result struct {
+		ip  string
+		err error
 	}
-
-	type candidate struct {
-		ip    string
-		prefs int
+	ch := make(chan result, 3)
+	endpoints := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
 	}
-	var candidates []candidate
-
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
-			continue
+	for _, url := range endpoints {
+		go func(u string) {
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Get(u)
+			if err != nil {
+				ch <- result{"", err}
+				return
+			}
+			var buf [64]byte
+			n, _ := resp.Body.Read(buf[:])
+			resp.Body.Close()
+			if n > 0 {
+				ip := strings.TrimSpace(string(buf[:n]))
+				if net.ParseIP(ip) != nil {
+					ch <- result{ip, nil}
+					return
+				}
+			}
+			ch <- result{"", fmt.Errorf("invalid ip")}
+		}(url)
+	}
+	for range endpoints {
+		r := <-ch
+		if r.err == nil && r.ip != "" {
+			return r.ip
 		}
-		if isLinkLocal(ipNet.IP) || isWSL(ipNet.IP.String()) {
-			continue
-		}
-		ipStr := ipNet.IP.String()
-		prefs := 1
-		if strings.HasPrefix(ipStr, "10.") {
-			prefs = 3
-		} else if strings.HasPrefix(ipStr, "192.168.") {
-			prefs = 2
-		}
-		candidates = append(candidates, candidate{ip: ipStr, prefs: prefs})
 	}
-
-	if len(candidates) == 0 {
-		return "127.0.0.1"
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].prefs > candidates[j].prefs
-	})
-	return candidates[0].ip
+	return ""
 }
 
 func handleConn(client net.Conn, id uint64, cfg Config) {
@@ -612,6 +640,29 @@ func relay(a, b net.Conn, cs *connStats) (int64, int64) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+func copyToClipboard(text string) {
+	switch runtime.GOOS {
+	case "windows":
+		tmp, err := os.CreateTemp("", "deltashare-clip-*.txt")
+		if err != nil {
+			return
+		}
+		tmpName := tmp.Name()
+		tmp.WriteString(text)
+		tmp.Close()
+		defer os.Remove(tmpName)
+		exec.Command("cmd", "/c", "clip < \""+tmpName+"\"").Run()
+	case "darwin":
+		cmd := exec.Command("pbcopy")
+		cmd.Stdin = strings.NewReader(text)
+		cmd.Run()
+	default:
+		cmd := exec.Command("xclip", "-selection", "clipboard")
+		cmd.Stdin = strings.NewReader(text)
+		cmd.Run()
+	}
+}
 
 func humanBytes(b int64) string {
 	switch {
